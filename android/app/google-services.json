@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "625512642632",
+    "project_id": "bookfoot237-99459",
+    "storage_bucket": "bookfoot237-99459.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:625512642632:android:b0a1b5386c2dbe565e007d",
+        "android_client_info": {
+          "package_name": "com.bookfoot237.app.bookfoot237"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDrKCc4lqpWzJumIJUqf5W_qwp8IbjCVRA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

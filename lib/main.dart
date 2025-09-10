@@ -2,6 +2,126 @@ import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+
+// Service Firebase Authentication
+class FirebaseAuthService {
+  static final FirebaseAuthService instance = FirebaseAuthService._internal();
+  FirebaseAuthService._internal();
+  
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+
+  // Utilisateur actuel
+  User? get currentUser => _auth.currentUser;
+  
+  // Stream des changements d'état d'authentification
+  Stream<User?> get authStateChanges => _auth.authStateChanges();
+  
+  // Inscription avec email/password
+  Future<UserCredential?> registerWithEmailAndPassword(
+    String email, 
+    String password, 
+    String fullName,
+    String userType, {
+    Map<String, dynamic>? stadiumData,
+  }) async {
+    try {
+      UserCredential result = await _auth.createUserWithEmailAndPassword(
+        email: email, 
+        password: password
+      );
+      
+      // Mettre à jour le profil utilisateur
+      await result.user?.updateDisplayName(fullName);
+      
+      // Sauvegarder les données utilisateur dans Firestore
+      await _firestore.collection('users').doc(result.user?.uid).set({
+        'email': email,
+        'fullName': fullName,
+        'userType': userType,
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+      
+      // Si c'est un gestionnaire, sauvegarder les données du stade
+      if (userType == 'gestionnaire' && stadiumData != null) {
+        await _firestore.collection('stadiums').add({
+          'managerId': result.user?.uid,
+          'managerEmail': email,
+          ...stadiumData,
+          'createdAt': FieldValue.serverTimestamp(),
+        });
+      }
+      
+      return result;
+    } catch (e) {
+      print('Erreur inscription: $e');
+      return null;
+    }
+  }
+  
+  // Connexion avec email/password
+  Future<UserCredential?> signInWithEmailAndPassword(String email, String password) async {
+    try {
+      UserCredential result = await _auth.signInWithEmailAndPassword(
+        email: email, 
+        password: password
+      );
+      return result;
+    } catch (e) {
+      print('Erreur connexion: $e');
+      return null;
+    }
+  }
+  
+  // Inscription/Connexion avec numéro de téléphone
+  Future<void> verifyPhoneNumber(
+    String phoneNumber,
+    Function(PhoneAuthCredential) verificationCompleted,
+    Function(FirebaseAuthException) verificationFailed,
+    Function(String, int?) codeSent,
+    Function(String) codeAutoRetrievalTimeout,
+  ) async {
+    await _auth.verifyPhoneNumber(
+      phoneNumber: phoneNumber,
+      verificationCompleted: verificationCompleted,
+      verificationFailed: verificationFailed,
+      codeSent: codeSent,
+      codeAutoRetrievalTimeout: codeAutoRetrievalTimeout,
+    );
+  }
+  
+  // Connexion avec credential téléphone
+  Future<UserCredential?> signInWithPhoneCredential(PhoneAuthCredential credential) async {
+    try {
+      return await _auth.signInWithCredential(credential);
+    } catch (e) {
+      print('Erreur connexion téléphone: $e');
+      return null;
+    }
+  }
+  
+  // Récupérer les données utilisateur
+  Future<Map<String, dynamic>?> getUserData() async {
+    final user = currentUser;
+    if (user != null) {
+      final doc = await _firestore.collection('users').doc(user.uid).get();
+      return doc.data();
+    }
+    return null;
+  }
+  
+  // Déconnexion
+  Future<void> signOut() async {
+    try {
+      return await _auth.signOut();
+    } catch (e) {
+      print('Erreur déconnexion: $e');
+    }
+  }
+}
 
 class ReservationRequest {
   final String id;
@@ -59,7 +179,9 @@ class ReservationRequest {
   );
 }
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
   runApp(const BookFootApp());
 }
 
@@ -105,27 +227,33 @@ class LoginPage extends StatefulWidget {
 class _LoginPageState extends State<LoginPage> {
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
+  final _phoneController = TextEditingController();
+  final _otpController = TextEditingController();
+  final FirebaseAuthService _authService = FirebaseAuthService.instance;
+  
+  bool _isPhoneAuth = false;
+  bool _isOtpSent = false;
+  String _verificationId = '';
 
   Future<void> _handleLogin() async {
     if (_emailController.text.isNotEmpty && _passwordController.text.isNotEmpty) {
       try {
-        final prefs = await SharedPreferences.getInstance();
-        final savedPassword = prefs.getString('user_${_emailController.text}');
+        final result = await _authService.signInWithEmailAndPassword(
+          _emailController.text.trim(),
+          _passwordController.text.trim(),
+        );
         
-        if (savedPassword == _passwordController.text) {
-          await prefs.setString('current_user', _emailController.text);
-          final userType = prefs.getString('usertype_${_emailController.text}') ?? 'client';
-          await prefs.setString('current_user_type', userType);
+        if (result != null && mounted) {
+          final userData = await _authService.getUserData();
+          final userType = userData?['userType'] ?? 'client';
           
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('Connexion réussie! Bienvenue ${_emailController.text}'),
-                backgroundColor: Colors.green,
-              ),
-            );
-            context.go('/home');
-          }
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Connexion réussie! Bienvenue ${result.user?.displayName ?? result.user?.email}'),
+              backgroundColor: Colors.green,
+            ),
+          );
+          context.go('/home');
         } else {
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
@@ -140,6 +268,98 @@ class _LoginPageState extends State<LoginPage> {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text('Erreur: $e'), backgroundColor: Colors.red),
+          );
+        }
+      }
+    }
+  }
+
+  Future<void> _handlePhoneAuth() async {
+    if (_phoneController.text.isNotEmpty) {
+      try {
+        await _authService.verifyPhoneNumber(
+          _phoneController.text.trim(),
+          (PhoneAuthCredential credential) async {
+            // Auto-résolution
+            final result = await _authService.signInWithPhoneCredential(credential);
+            if (result != null && mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('Connexion par téléphone réussie!'),
+                  backgroundColor: Colors.green,
+                ),
+              );
+              context.go('/home');
+            }
+          },
+          (FirebaseAuthException e) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Erreur: ${e.message}'),
+                  backgroundColor: Colors.red,
+                ),
+              );
+            }
+          },
+          (String verificationId, int? resendToken) {
+            setState(() {
+              _verificationId = verificationId;
+              _isOtpSent = true;
+            });
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('Code de vérification envoyé!'),
+                  backgroundColor: Colors.blue,
+                ),
+              );
+            }
+          },
+          (String verificationId) {
+            setState(() {
+              _verificationId = verificationId;
+            });
+          },
+        );
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Erreur: $e'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+      }
+    }
+  }
+
+  Future<void> _verifyOtp() async {
+    if (_otpController.text.isNotEmpty && _verificationId.isNotEmpty) {
+      try {
+        final credential = PhoneAuthProvider.credential(
+          verificationId: _verificationId,
+          smsCode: _otpController.text.trim(),
+        );
+        
+        final result = await _authService.signInWithPhoneCredential(credential);
+        if (result != null && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Connexion par téléphone réussie!'),
+              backgroundColor: Colors.green,
+            ),
+          );
+          context.go('/home');
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Code incorrect: $e'),
+              backgroundColor: Colors.red,
+            ),
           );
         }
       }
@@ -244,41 +464,116 @@ class _LoginPageState extends State<LoginPage> {
                       ),
                       const SizedBox(height: 24),
                       
-                      // Login form fields
-                      TextFormField(
-                        controller: _emailController,
-                        decoration: InputDecoration(
-                          labelText: 'Email',
-                          prefixIcon: const Icon(Icons.email),
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(12),
+                      // Toggle between email and phone auth
+                      Row(
+                        children: [
+                          Expanded(
+                            child: OutlinedButton(
+                              onPressed: () => setState(() => _isPhoneAuth = false),
+                              style: OutlinedButton.styleFrom(
+                                backgroundColor: !_isPhoneAuth ? const Color(0xFF1E88E5) : null,
+                                foregroundColor: !_isPhoneAuth ? Colors.white : const Color(0xFF1E88E5),
+                              ),
+                              child: const Text('Email'),
+                            ),
                           ),
-                          filled: true,
-                          fillColor: Colors.grey.shade50,
-                        ),
+                          const SizedBox(width: 16),
+                          Expanded(
+                            child: OutlinedButton(
+                              onPressed: () => setState(() => _isPhoneAuth = true),
+                              style: OutlinedButton.styleFrom(
+                                backgroundColor: _isPhoneAuth ? const Color(0xFF1E88E5) : null,
+                                foregroundColor: _isPhoneAuth ? Colors.white : const Color(0xFF1E88E5),
+                              ),
+                              child: const Text('Téléphone'),
+                            ),
+                          ),
+                        ],
                       ),
                       const SizedBox(height: 16),
                       
-                      TextFormField(
-                        controller: _passwordController,
-                        obscureText: true,
-                        decoration: InputDecoration(
-                          labelText: 'Mot de passe',
-                          prefixIcon: const Icon(Icons.lock),
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(12),
+                      // Email auth fields
+                      if (!_isPhoneAuth) ...[
+                        TextFormField(
+                          controller: _emailController,
+                          decoration: InputDecoration(
+                            labelText: 'Email',
+                            prefixIcon: const Icon(Icons.email),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            filled: true,
+                            fillColor: Colors.grey.shade50,
                           ),
-                          filled: true,
-                          fillColor: Colors.grey.shade50,
                         ),
-                      ),
+                        const SizedBox(height: 16),
+                        
+                        TextFormField(
+                          controller: _passwordController,
+                          obscureText: true,
+                          decoration: InputDecoration(
+                            labelText: 'Mot de passe',
+                            prefixIcon: const Icon(Icons.lock),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            filled: true,
+                            fillColor: Colors.grey.shade50,
+                          ),
+                        ),
+                      ],
+                      
+                      // Phone auth fields
+                      if (_isPhoneAuth) ...[
+                        TextFormField(
+                          controller: _phoneController,
+                          keyboardType: TextInputType.phone,
+                          decoration: InputDecoration(
+                            labelText: 'Numéro de téléphone',
+                            hintText: '+237612345678',
+                            prefixIcon: const Icon(Icons.phone),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            filled: true,
+                            fillColor: Colors.grey.shade50,
+                          ),
+                        ),
+                        if (_isOtpSent) ...[
+                          const SizedBox(height: 16),
+                          TextFormField(
+                            controller: _otpController,
+                            keyboardType: TextInputType.number,
+                            decoration: InputDecoration(
+                              labelText: 'Code de vérification',
+                              hintText: '123456',
+                              prefixIcon: const Icon(Icons.sms),
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              filled: true,
+                              fillColor: Colors.grey.shade50,
+                            ),
+                          ),
+                        ],
+                      ],
                       const SizedBox(height: 24),
                       
                       // Login button
                       SizedBox(
                         width: double.infinity,
                         child: ElevatedButton(
-                          onPressed: _handleLogin,
+                          onPressed: () {
+                            if (_isPhoneAuth) {
+                              if (_isOtpSent) {
+                                _verifyOtp();
+                              } else {
+                                _handlePhoneAuth();
+                              }
+                            } else {
+                              _handleLogin();
+                            }
+                          },
                           style: ElevatedButton.styleFrom(
                             backgroundColor: const Color(0xFF1E88E5),
                             foregroundColor: Colors.white,
@@ -287,9 +582,11 @@ class _LoginPageState extends State<LoginPage> {
                               borderRadius: BorderRadius.circular(12),
                             ),
                           ),
-                          child: const Text(
-                            'Se connecter',
-                            style: TextStyle(
+                          child: Text(
+                            _isPhoneAuth 
+                              ? (_isOtpSent ? 'Vérifier le code' : 'Envoyer le code')
+                              : 'Se connecter',
+                            style: const TextStyle(
                               fontSize: 16,
                               fontWeight: FontWeight.bold,
                             ),
@@ -380,55 +677,80 @@ class _RegisterPageState extends State<RegisterPage> {
         );
         return;
       }
-
+      
       try {
-        final prefs = await SharedPreferences.getInstance();
+        // Register with Firebase
+        UserCredential? result = await FirebaseAuthService.instance.registerWithEmailAndPassword(
+          _emailController.text.trim(),
+          _passwordController.text,
+          _nomController.text.trim(),
+          _userType,
+        );
         
-        // Check if email already exists
-        final existingUser = prefs.getString('user_${_emailController.text}');
-        if (existingUser != null) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Cet email est déjà utilisé'),
-              backgroundColor: Colors.red,
-            ),
-          );
-          return;
-        }
-
-        // Save user data
-        await prefs.setString('user_${_emailController.text}', _passwordController.text);
-        await prefs.setString('username_${_emailController.text}', _nomController.text);
-        await prefs.setString('usertype_${_emailController.text}', _userType);
-
-        // Save stadium data if user is manager
-        if (_userType == 'gestionnaire') {
-          final stadeData = {
-            'nom': _stadeNomController.text,
-            'adresse': _stadeAdresseController.text,
-            'prix': int.parse(_stadePrixController.text),
-            'capacite': _stadeCapacite,
-            'type': _stadeType,
-            'gestionnaire': _emailController.text,
+        if (result != null) {
+          // Save additional user data to Firestore
+          Map<String, dynamic> userData = {
+            'name': _nomController.text.trim(),
+            'email': _emailController.text.trim(),
+            'userType': _userType,
+            'createdAt': DateTime.now().toIso8601String(),
           };
-          await prefs.setString('stade_${_emailController.text}', 
-              '${stadeData['nom']}|${stadeData['adresse']}|${stadeData['prix']}|${stadeData['capacite']}|${stadeData['type']}|${stadeData['gestionnaire']}');
+          
+          // Add stadium data if user is manager
+          if (_userType == 'gestionnaire') {
+            userData['stade'] = {
+              'nom': _stadeNomController.text.trim(),
+              'adresse': _stadeAdresseController.text.trim(),
+              'prix': int.parse(_stadePrixController.text),
+              'capacite': _stadeCapacite,
+              'type': _stadeType,
+              'disponible': true,
+              'description': 'Stade géré par ${_nomController.text.trim()}',
+            };
+          }
+          
+          // Save to Firestore
+          await FirebaseFirestore.instance
+              .collection('users')
+              .doc(result.user!.uid)
+              .set(userData);
+          
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Compte créé avec succès! Connectez-vous maintenant avec ${_emailController.text}'),
+                backgroundColor: Colors.green,
+                duration: const Duration(seconds: 4),
+                action: SnackBarAction(
+                  label: 'Connexion',
+                  textColor: Colors.white,
+                  onPressed: () => context.go('/login'),
+                ),
+              ),
+            );
+            context.go('/login');
+          }
         }
-
+      } on FirebaseAuthException catch (e) {
+        String errorMessage = 'Erreur d\'inscription';
+        switch (e.code) {
+          case 'weak-password':
+            errorMessage = 'Le mot de passe est trop faible';
+            break;
+          case 'email-already-in-use':
+            errorMessage = 'Cet email est déjà utilisé';
+            break;
+          case 'invalid-email':
+            errorMessage = 'Email invalide';
+            break;
+          default:
+            errorMessage = 'Erreur: ${e.message}';
+        }
+        
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Compte créé avec succès! Connectez-vous maintenant avec ${_emailController.text}'),
-              backgroundColor: Colors.green,
-              duration: const Duration(seconds: 4),
-              action: SnackBarAction(
-                label: 'Connexion',
-                textColor: Colors.white,
-                onPressed: () => context.go('/login'),
-              ),
-            ),
+            SnackBar(content: Text(errorMessage), backgroundColor: Colors.red),
           );
-          context.go('/login');
         }
       } catch (e) {
         if (mounted) {
