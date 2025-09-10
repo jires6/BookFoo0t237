@@ -1053,7 +1053,7 @@ class _HomePageState extends State<HomePage> {
               ],
             ),
           ),
-          if (_currentUserType == 'gestionnaire') ..[
+          if (_currentUserType == 'gestionnaire') ...[
             ListTile(
               leading: const Icon(Icons.stadium),
               title: const Text('Mon Stade'),
@@ -1076,7 +1076,7 @@ class _HomePageState extends State<HomePage> {
                 Navigator.pop(context);
               },
             ),
-          ] else if (_currentUserType == 'client') ..[
+          ] else if (_currentUserType == 'client') ...[
             ListTile(
               leading: const Icon(Icons.stadium),
               title: const Text('Terrains Disponibles'),
@@ -1099,7 +1099,7 @@ class _HomePageState extends State<HomePage> {
                 Navigator.pop(context);
               },
             ),
-          ] else ..[
+          ] else ...[
             ListTile(
               leading: const Icon(Icons.stadium),
               title: const Text('Explorer les Terrains'),
@@ -1141,7 +1141,7 @@ class _HomePageState extends State<HomePage> {
   Widget _buildStadesView() {
     return Column(
       children: [
-        if (_currentUserType != 'gestionnaire') ..[
+        if (_currentUserType != 'gestionnaire') ...[
           // Search bar for clients and visitors
           Padding(
             padding: const EdgeInsets.all(16.0),
@@ -1189,7 +1189,7 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
           const SizedBox(height: 16),
-        ] else ..[
+        ] else ...[
           // Header for manager
           Container(
             width: double.infinity,
@@ -1531,7 +1531,7 @@ class _HomePageState extends State<HomePage> {
                 ),
               ],
             ),
-            if (request.raison.isNotEmpty) ..[
+            if (request.raison.isNotEmpty) ...[
               const SizedBox(height: 8),
               Text(
                 'Raison: ${request.raison}',
@@ -1665,7 +1665,7 @@ class _HomePageState extends State<HomePage> {
                 ),
               ],
             ),
-            if (request.raison.isNotEmpty) ..[
+            if (request.raison.isNotEmpty) ...[
               const SizedBox(height: 8),
               Text(
                 'Raison: ${request.raison}',
@@ -1676,7 +1676,7 @@ class _HomePageState extends State<HomePage> {
               ),
             ],
             const SizedBox(height: 12),
-            if (request.statut == 'en_attente') ..[
+            if (request.statut == 'en_attente') ...[
               Row(
                 children: [
                   Expanded(
@@ -2012,6 +2012,17 @@ class _ReservationDialogState extends State<ReservationDialog> {
   Future<void> _submitReservation() async {
     if (_formKey.currentState!.validate()) {
       try {
+        // Check user type first - block visitors
+        final prefs = await SharedPreferences.getInstance();
+        final currentUser = prefs.getString('current_user');
+        final userType = prefs.getString('current_user_type') ?? 'visiteur';
+        
+        if (currentUser == null || userType == 'visiteur') {
+          // Show visitor blocking dialog
+          _showVisitorBlockDialog();
+          return;
+        }
+        
         // Validate required fields
         if (_nomController.text.trim().isEmpty) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -2057,7 +2068,6 @@ class _ReservationDialogState extends State<ReservationDialog> {
           dateCreation: DateTime.now(),
         );
 
-        final prefs = await SharedPreferences.getInstance();
         final requests = prefs.getStringList('reservation_requests') ?? [];
         requests.add(request.id);
         await prefs.setStringList('reservation_requests', requests);
@@ -2139,6 +2149,68 @@ class _ReservationDialogState extends State<ReservationDialog> {
           TextButton(
             onPressed: () => Navigator.of(context).pop(),
             child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showVisitorBlockDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.warning, color: Colors.orange, size: 28),
+            const SizedBox(width: 8),
+            const Expanded(
+              child: Text(
+                'Réservation impossible',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Vous ne pouvez pas effectuer de réservation en tant que visiteur.',
+              style: TextStyle(fontSize: 16),
+            ),
+            const SizedBox(height: 12),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.blue.shade50,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.blue.shade200),
+              ),
+              child: const Text(
+                '💡 Pour effectuer des réservations, vous devez créer un compte client ou gestionnaire.',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Annuler'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.of(context).pop(); // Close dialog
+              Navigator.of(context).pop(); // Close reservation form
+              // Navigate to registration
+              context.go('/register');
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF1E88E5),
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Créer un compte pour réserver'),
           ),
         ],
       ),
