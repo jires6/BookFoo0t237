@@ -5,14 +5,18 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'services/notification_service.dart';
+import 'services/app_lifecycle_service.dart';
 
-// Service Firebase Authentication
+// Service Firebase Authentication avec messaging
 class FirebaseAuthService {
   static final FirebaseAuthService instance = FirebaseAuthService._internal();
   FirebaseAuthService._internal();
   
   final FirebaseAuth _auth = FirebaseAuth.instance;
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final FirebaseMessaging _messaging = FirebaseMessaging.instance;
 
   // Utilisateur actuel
   User? get currentUser => _auth.currentUser;
@@ -113,6 +117,45 @@ class FirebaseAuthService {
     return null;
   }
   
+  // Initialiser FCM
+  Future<void> initializeMessaging() async {
+    try {
+      // Demander la permission pour les notifications
+      await _messaging.requestPermission(
+        alert: true,
+        badge: true,
+        sound: true,
+      );
+      
+      // Obtenir le token FCM
+      String? token = await _messaging.getToken();
+      if (token != null) {
+        print('FCM Token: $token');
+        // Sauvegarder le token dans Firestore pour l'utilisateur connecté
+        if (currentUser != null) {
+          await _firestore.collection('users').doc(currentUser!.uid).update({
+            'fcmToken': token,
+            'lastTokenUpdate': FieldValue.serverTimestamp(),
+          });
+        }
+      }
+      
+      // Écouter les changements de token
+      _messaging.onTokenRefresh.listen((newToken) async {
+        if (currentUser != null) {
+          await _firestore.collection('users').doc(currentUser!.uid).update({
+            'fcmToken': newToken,
+            'lastTokenUpdate': FieldValue.serverTimestamp(),
+          });
+        }
+      });
+      
+      print('Firebase Messaging initialisé avec succès');
+    } catch (e) {
+      print('Erreur initialisation FCM: $e');
+    }
+  }
+  
   // Déconnexion
   Future<void> signOut() async {
     try {
@@ -182,6 +225,13 @@ class ReservationRequest {
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp();
+  
+  // Initialiser Firebase Cloud Messaging
+  await FirebaseAuthService.instance.initializeMessaging();
+  
+  // Initialiser le service de cycle de vie pour empêcher l'auto-destruction
+  AppLifecycleService().initialize();
+  
   runApp(const BookFootApp());
 }
 
@@ -246,10 +296,23 @@ class _LoginPageState extends State<LoginPage> {
         if (result != null && mounted) {
           final userData = await _authService.getUserData();
           final userType = userData?['userType'] ?? 'client';
+          final userName = userData?['fullName'] ?? userData?['name'] ?? result.user?.displayName ?? 'Utilisateur';
+          final userEmail = result.user?.email ?? '';
+          
+          // Sauvegarder les données utilisateur dans SharedPreferences
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString('current_user', userEmail);
+          await prefs.setString('current_user_type', userType);
+          await prefs.setString('username_$userEmail', userName);
+          
+          print('✅ Utilisateur connecté: $userEmail ($userType) - $userName');
+          
+          // Initialiser FCM pour l'utilisateur connecté
+          await _authService.initializeMessaging();
           
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('Connexion réussie! Bienvenue ${result.user?.displayName ?? result.user?.email}'),
+              content: Text('Connexion réussie! Bienvenue $userName'),
               backgroundColor: Colors.green,
             ),
           );
@@ -656,8 +719,10 @@ class _RegisterPageState extends State<RegisterPage> {
   final _formKey = GlobalKey<FormState>();
   final _nomController = TextEditingController();
   final _emailController = TextEditingController();
+  final _telephoneController = TextEditingController();
   final _passwordController = TextEditingController();
   final _confirmPasswordController = TextEditingController();
+  final _otpController = TextEditingController();
   final _stadeNomController = TextEditingController();
   final _stadeAdresseController = TextEditingController();
   final _stadePrixController = TextEditingController();
@@ -665,6 +730,248 @@ class _RegisterPageState extends State<RegisterPage> {
   String _userType = 'client';
   String _stadeCapacite = '11v11';
   String _stadeType = 'Terrain en herbe naturelle';
+  String _verificationType = 'email'; // 'email' ou 'phone'
+  bool _isOtpSent = false;
+  bool _isOtpVerified = false;
+  String _verificationId = '';
+
+  Future<void> _sendOtpVerification() async {
+    if (!_formKey.currentState!.validate()) return;
+
+    if (_verificationType == 'email') {
+      await _sendEmailOtp();
+    } else {
+      await _sendPhoneOtp();
+    }
+  }
+
+  Future<void> _sendEmailOtp() async {
+    try {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Envoi du code par email...'),
+          backgroundColor: Colors.blue,
+        ),
+      );
+      
+      // Utiliser le service d'email réel
+      final otpCode = await NotificationService.instance.sendEmailOtp(_emailController.text.trim());
+      
+      if (otpCode != null) {
+        // Stocker le code et l'heure pour vérification
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('otp_${_emailController.text}', otpCode);
+        await prefs.setInt('otp_time_${_emailController.text}', DateTime.now().millisecondsSinceEpoch);
+        
+        setState(() {
+          _isOtpSent = true;
+        });
+        
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('✅ Code envoyé à ${_emailController.text}!\nVérifiez votre boîte email (et spam).'),
+            backgroundColor: Colors.green,
+            duration: const Duration(seconds: 6),
+          ),
+        );
+      } else {
+        // Fallback si l'envoi réel échoue
+        final random = DateTime.now().millisecondsSinceEpoch % 900000 + 100000;
+        final fallbackCode = random.toString();
+        
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('otp_${_emailController.text}', fallbackCode);
+        await prefs.setInt('otp_time_${_emailController.text}', DateTime.now().millisecondsSinceEpoch);
+        
+        setState(() {
+          _isOtpSent = true;
+        });
+        
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('⚠️ Mode démo - Email non envoyé'),
+                const SizedBox(height: 4),
+                Text('Code test: $fallbackCode', style: const TextStyle(fontWeight: FontWeight.bold)),
+                const Text('Configurez SMTP pour envoi réel', style: TextStyle(fontSize: 12)),
+              ],
+            ),
+            backgroundColor: Colors.orange,
+            duration: const Duration(seconds: 8),
+          ),
+        );
+      }
+      
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Erreur: $e'), backgroundColor: Colors.red),
+      );
+    }
+  }
+
+  Future<void> _sendPhoneOtp() async {
+    if (_telephoneController.text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Numéro de téléphone requis'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    String phoneNumber = _telephoneController.text.trim();
+    if (!phoneNumber.startsWith('+237')) {
+      phoneNumber = '+237$phoneNumber';
+    }
+
+    try {
+      await FirebaseAuthService.instance.verifyPhoneNumber(
+        phoneNumber,
+        (PhoneAuthCredential credential) {
+          // Auto-résolution
+          setState(() {
+            _isOtpVerified = true;
+          });
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Numéro vérifié automatiquement!'),
+              backgroundColor: Colors.green,
+            ),
+          );
+        },
+        (FirebaseAuthException e) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Erreur: ${e.message}'), backgroundColor: Colors.red),
+          );
+        },
+        (String verificationId, int? resendToken) {
+          setState(() {
+            _verificationId = verificationId;
+            _isOtpSent = true;
+          });
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Code SMS envoyé!'),
+              backgroundColor: Colors.blue,
+            ),
+          );
+        },
+        (String verificationId) {
+          setState(() {
+            _verificationId = verificationId;
+          });
+        },
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Erreur: $e'), backgroundColor: Colors.red),
+      );
+    }
+  }
+
+  Future<void> _verifyOtp() async {
+    if (_otpController.text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Code OTP requis'), backgroundColor: Colors.red),
+      );
+      return;
+    }
+
+    if (_verificationType == 'email') {
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        final storedCode = prefs.getString('otp_${_emailController.text}');
+        final codeTime = prefs.getInt('otp_time_${_emailController.text}');
+        
+        if (storedCode == null || codeTime == null) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Code expiré. Veuillez renvoyer un nouveau code.'),
+              backgroundColor: Colors.red,
+            ),
+          );
+          return;
+        }
+        
+        // Vérifier que le code n'est pas expiré (5 minutes)
+        final now = DateTime.now().millisecondsSinceEpoch;
+        if (now - codeTime > 300000) { // 5 minutes en millisecondes
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Code expiré (5 min max). Veuillez renvoyer un nouveau code.'),
+              backgroundColor: Colors.red,
+            ),
+          );
+          return;
+        }
+        
+        if (_otpController.text.trim() == storedCode) {
+          setState(() {
+            _isOtpVerified = true;
+          });
+          
+          // Supprimer le code utilisé
+          prefs.remove('otp_${_emailController.text}');
+          prefs.remove('otp_time_${_emailController.text}');
+          
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Email vérifié avec succès!'),
+              backgroundColor: Colors.green,
+            ),
+          );
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Code incorrect. Vérifiez le code reçu.'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Erreur de vérification: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } else {
+      // Vérification SMS
+      try {
+        final credential = PhoneAuthProvider.credential(
+          verificationId: _verificationId,
+          smsCode: _otpController.text.trim(),
+        );
+        
+        // Tester la validité du credential
+        await FirebaseAuth.instance.signInWithCredential(credential);
+        await FirebaseAuth.instance.signOut(); // Se déconnecter immédiatement
+        
+        setState(() {
+          _isOtpVerified = true;
+        });
+        
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Numéro vérifié avec succès!'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Code incorrect: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
 
   Future<void> _handleRegister() async {
     if (_formKey.currentState!.validate()) {
@@ -677,8 +984,20 @@ class _RegisterPageState extends State<RegisterPage> {
         );
         return;
       }
+
+      if (!_isOtpVerified) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Vous devez vérifier votre email ou téléphone avant de créer le compte'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+        return;
+      }
       
       try {
+        print('🚀 Début création compte pour ${_emailController.text.trim()}');
+        
         // Register with Firebase
         UserCredential? result = await FirebaseAuthService.instance.registerWithEmailAndPassword(
           _emailController.text.trim(),
@@ -686,6 +1005,8 @@ class _RegisterPageState extends State<RegisterPage> {
           _nomController.text.trim(),
           _userType,
         );
+        
+        print('✅ Résultat Firebase Auth: ${result != null ? "Succès" : "Échec"}');
         
         if (result != null) {
           // Save additional user data to Firestore
@@ -695,6 +1016,15 @@ class _RegisterPageState extends State<RegisterPage> {
             'userType': _userType,
             'createdAt': DateTime.now().toIso8601String(),
           };
+
+          // Ajouter téléphone pour les clients
+          if (_userType == 'client' && _telephoneController.text.isNotEmpty) {
+            String phoneNumber = _telephoneController.text.trim();
+            if (!phoneNumber.startsWith('+237')) {
+              phoneNumber = '+237$phoneNumber';
+            }
+            userData['telephone'] = phoneNumber;
+          }
           
           // Add stadium data if user is manager
           if (_userType == 'gestionnaire') {
@@ -710,10 +1040,13 @@ class _RegisterPageState extends State<RegisterPage> {
           }
           
           // Save to Firestore
+          print('💾 Sauvegarde données utilisateur dans Firestore...');
           await FirebaseFirestore.instance
               .collection('users')
               .doc(result.user!.uid)
               .set(userData);
+          
+          print('✅ Compte créé avec succès ! Redirection vers login...');
           
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
@@ -861,6 +1194,43 @@ class _RegisterPageState extends State<RegisterPage> {
                     ),
                     const SizedBox(height: 16),
                     
+                    // Champ téléphone pour les clients
+                    if (_userType == 'client') ...[
+                      TextFormField(
+                        controller: _telephoneController,
+                        keyboardType: TextInputType.phone,
+                        decoration: InputDecoration(
+                          labelText: 'Téléphone (+237) *',
+                          prefixIcon: const Icon(Icons.phone),
+                          prefixText: '+237 ',
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                          helperText: 'Exemple: 612345678',
+                        ),
+                        validator: (value) {
+                          if (_userType == 'client' && (value?.isEmpty == true)) {
+                            return 'Numéro de téléphone requis pour les clients';
+                          }
+                          if (_userType == 'client' && value != null && value.isNotEmpty) {
+                            final cleanNumber = value.replaceAll(' ', '').replaceAll('+237', '');
+                            if (cleanNumber.length != 9) {
+                              return 'Numéro invalide (9 chiffres requis)';
+                            }
+                          }
+                          return null;
+                        },
+                        onChanged: (value) {
+                          // Auto-format le numéro
+                          if (value.startsWith('+237')) {
+                            _telephoneController.text = value.substring(4);
+                            _telephoneController.selection = TextSelection.fromPosition(
+                              TextPosition(offset: _telephoneController.text.length),
+                            );
+                          }
+                        },
+                      ),
+                      const SizedBox(height: 16),
+                    ],
+                    
                     TextFormField(
                       controller: _passwordController,
                       obscureText: true,
@@ -886,6 +1256,131 @@ class _RegisterPageState extends State<RegisterPage> {
                         border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                       ),
                       validator: (value) => value?.isEmpty == true ? 'Confirmation requise' : null,
+                    ),
+                    const SizedBox(height: 24),
+                    
+                    // Section de vérification OTP
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Colors.blue.shade50,
+                        border: Border.all(color: Colors.blue.shade200),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Vérification du compte',
+                            style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue),
+                          ),
+                          const SizedBox(height: 12),
+                          const Text(
+                            'Choisissez comment vérifier votre identité:',
+                            style: TextStyle(color: Colors.black87),
+                          ),
+                          const SizedBox(height: 16),
+                          
+                          // Toggle entre email et téléphone pour vérification
+                          Row(
+                            children: [
+                              Expanded(
+                                child: OutlinedButton(
+                                  onPressed: () => setState(() => _verificationType = 'email'),
+                                  style: OutlinedButton.styleFrom(
+                                    backgroundColor: _verificationType == 'email' ? Colors.blue : null,
+                                    foregroundColor: _verificationType == 'email' ? Colors.white : Colors.blue,
+                                  ),
+                                  child: const Text('Par Email'),
+                                ),
+                              ),
+                              if (_userType == 'client') ...[
+                                const SizedBox(width: 16),
+                                Expanded(
+                                  child: OutlinedButton(
+                                    onPressed: () => setState(() => _verificationType = 'phone'),
+                                    style: OutlinedButton.styleFrom(
+                                      backgroundColor: _verificationType == 'phone' ? Colors.blue : null,
+                                      foregroundColor: _verificationType == 'phone' ? Colors.white : Colors.blue,
+                                    ),
+                                    child: const Text('Par SMS'),
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                          const SizedBox(height: 16),
+                          
+                          // Bouton d'envoi OTP
+                          if (!_isOtpSent && !_isOtpVerified)
+                            SizedBox(
+                              width: double.infinity,
+                              child: ElevatedButton.icon(
+                                onPressed: _sendOtpVerification,
+                                icon: const Icon(Icons.send),
+                                label: Text('Envoyer code ${_verificationType == 'email' ? 'email' : 'SMS'}'),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.blue,
+                                  foregroundColor: Colors.white,
+                                ),
+                              ),
+                            ),
+                          
+                          // Champ de saisie OTP
+                          if (_isOtpSent && !_isOtpVerified) ...[
+                            TextFormField(
+                              controller: _otpController,
+                              keyboardType: TextInputType.number,
+                              decoration: InputDecoration(
+                                labelText: 'Code de vérification *',
+                                hintText: _verificationType == 'email' ? '123456' : 'Code SMS reçu',
+                                prefixIcon: const Icon(Icons.security),
+                                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                                helperText: _verificationType == 'email' ? 'Code demo: 123456' : null,
+                              ),
+                              validator: (value) => value?.isEmpty == true ? 'Code OTP requis' : null,
+                            ),
+                            const SizedBox(height: 16),
+                            SizedBox(
+                              width: double.infinity,
+                              child: ElevatedButton.icon(
+                                onPressed: _verifyOtp,
+                                icon: const Icon(Icons.verified),
+                                label: const Text('Vérifier le code'),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.green,
+                                  foregroundColor: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ],
+                          
+                          // Confirmation de vérification
+                          if (_isOtpVerified)
+                            Container(
+                              padding: const EdgeInsets.all(12),
+                              decoration: BoxDecoration(
+                                color: Colors.green.shade100,
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Row(
+                                children: [
+                                  const Icon(Icons.check_circle, color: Colors.green),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Text(
+                                      '✓ ${_verificationType == 'email' ? 'Email' : 'Téléphone'} vérifié avec succès!',
+                                      style: const TextStyle(
+                                        color: Colors.green,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                        ],
+                      ),
                     ),
                     const SizedBox(height: 16),
                     
@@ -1039,8 +1534,10 @@ class _RegisterPageState extends State<RegisterPage> {
   void dispose() {
     _nomController.dispose();
     _emailController.dispose();
+    _telephoneController.dispose();
     _passwordController.dispose();
     _confirmPasswordController.dispose();
+    _otpController.dispose();
     _stadeNomController.dispose();
     _stadeAdresseController.dispose();
     _stadePrixController.dispose();
@@ -1073,10 +1570,29 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _loadUserData() async {
     try {
+      // Vérifier d'abord Firebase Auth
+      final firebaseUser = FirebaseAuth.instance.currentUser;
       final prefs = await SharedPreferences.getInstance();
-      _currentUser = prefs.getString('current_user') ?? 'Visiteur';
-      _currentUserType = prefs.getString('current_user_type') ?? 'visiteur';
-      _currentUserName = prefs.getString('username_$_currentUser') ?? _currentUser;
+      
+      if (firebaseUser != null) {
+        // Utilisateur connecté avec Firebase - utiliser ses données
+        final userData = await FirebaseAuthService.instance.getUserData();
+        _currentUser = firebaseUser.email ?? 'Utilisateur';
+        _currentUserType = userData?['userType'] ?? 'client';
+        _currentUserName = userData?['fullName'] ?? userData?['name'] ?? firebaseUser.displayName ?? 'Utilisateur';
+        
+        // Mettre à jour SharedPreferences avec les données actuelles
+        await prefs.setString('current_user', _currentUser);
+        await prefs.setString('current_user_type', _currentUserType);
+        await prefs.setString('username_$_currentUser', _currentUserName);
+      } else {
+        // Fallback sur SharedPreferences
+        _currentUser = prefs.getString('current_user') ?? 'Visiteur';
+        _currentUserType = prefs.getString('current_user_type') ?? 'visiteur';
+        _currentUserName = prefs.getString('username_$_currentUser') ?? _currentUser;
+      }
+      
+      print('🔄 Données utilisateur chargées - User: $_currentUser ($_currentUserType) - $_currentUserName');
       
       await _loadStades();
       if (_currentUserType == 'client') {
@@ -1198,9 +1714,42 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _loadUserReservations() async {
     try {
+      _userReservations.clear();
+      
+      // Récupérer depuis Firestore si utilisateur Firebase connecté
+      final firebaseUser = FirebaseAuth.instance.currentUser;
+      if (firebaseUser != null) {
+        final firestore = FirebaseFirestore.instance;
+        final querySnapshot = await firestore
+            .collection('reservations')
+            .where('userId', isEqualTo: firebaseUser.uid)
+            .orderBy('createdAt', descending: true)
+            .get();
+            
+        for (final doc in querySnapshot.docs) {
+          final data = doc.data();
+          final request = ReservationRequest(
+            id: doc.id,
+            stadeId: data['stadeId'] ?? '',
+            stadeNom: data['stadeNom'] ?? '',
+            clientNom: data['clientNom'] ?? '',
+            clientEmail: data['clientEmail'] ?? '',
+            clientTelephone: data['clientTelephone'] ?? '',
+            dateReservation: (data['dateReservation'] as String?) ?? '',
+            heureReservation: data['heureReservation'] ?? '',
+            statut: data['statut'] ?? 'En attente',
+            dateCreation: (data['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
+          );
+          _userReservations.add(request);
+        }
+        
+        print('📋 Réservations chargées depuis Firestore: ${_userReservations.length}');
+        return;
+      }
+      
+      // Fallback : SharedPreferences pour les anciens utilisateurs
       final prefs = await SharedPreferences.getInstance();
       final requestIds = prefs.getStringList('reservation_requests') ?? [];
-      _userReservations.clear();
       
       for (final id in requestIds) {
         try {
@@ -2334,16 +2883,20 @@ class _ReservationDialogState extends State<ReservationDialog> {
   Future<void> _submitReservation() async {
     if (_formKey.currentState!.validate()) {
       try {
-        // Check user type first - block visitors
+        // Check user authentication - use Firebase Auth + SharedPreferences
+        final firebaseUser = FirebaseAuth.instance.currentUser;
         final prefs = await SharedPreferences.getInstance();
         final currentUser = prefs.getString('current_user');
         final userType = prefs.getString('current_user_type') ?? 'visiteur';
         
-        if (currentUser == null || userType == 'visiteur') {
-          // Show visitor blocking dialog
+        // Block if not authenticated or is visitor
+        if (firebaseUser == null || currentUser == null || userType == 'visiteur') {
+          print('❌ Réservation bloquée - User: $currentUser, Type: $userType, Firebase: ${firebaseUser?.email}');
           _showVisitorBlockDialog();
           return;
         }
+        
+        print('✅ Réservation autorisée - User: $currentUser ($userType)');
         
         // Validate required fields
         if (_nomController.text.trim().isEmpty) {
@@ -2390,6 +2943,28 @@ class _ReservationDialogState extends State<ReservationDialog> {
           dateCreation: DateTime.now(),
         );
 
+        // Sauvegarder dans Firestore pour les utilisateurs Firebase
+        if (firebaseUser != null) {
+          await FirebaseFirestore.instance.collection('reservations').add({
+            'userId': firebaseUser.uid,
+            'stadeId': request.stadeId,
+            'stadeNom': request.stadeNom,
+            'clientNom': request.clientNom,
+            'clientEmail': request.clientEmail,
+            'clientTelephone': _telephoneController.text.trim(),
+            'dateReservation': DateFormat('dd/MM/yyyy').format(request.dateReservation),
+            'heureReservation': '${request.heureDebut} - ${request.heureFin}',
+            'heureDebut': request.heureDebut,
+            'heureFin': request.heureFin,
+            'raison': request.raison,
+            'statut': 'En attente',
+            'createdAt': FieldValue.serverTimestamp(),
+          });
+          
+          print('💾 Réservation sauvegardée dans Firestore');
+        }
+
+        // Fallback : SharedPreferences pour compatibilité
         final requests = prefs.getStringList('reservation_requests') ?? [];
         requests.add(request.id);
         await prefs.setStringList('reservation_requests', requests);
