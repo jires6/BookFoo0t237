@@ -1714,10 +1714,12 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _loadUserReservations() async {
     try {
+      print('🔄 Chargement des réservations...');
       _userReservations.clear();
       
       // Récupérer depuis Firestore si utilisateur Firebase connecté
       final firebaseUser = FirebaseAuth.instance.currentUser;
+      print('👤 Firebase User: ${firebaseUser?.email}');
       if (firebaseUser != null) {
         final firestore = FirebaseFirestore.instance;
         final querySnapshot = await firestore
@@ -1734,9 +1736,10 @@ class _HomePageState extends State<HomePage> {
             stadeNom: data['stadeNom'] ?? '',
             clientNom: data['clientNom'] ?? '',
             clientEmail: data['clientEmail'] ?? '',
-            clientTelephone: data['clientTelephone'] ?? '',
-            dateReservation: (data['dateReservation'] as String?) ?? '',
-            heureReservation: data['heureReservation'] ?? '',
+            dateReservation: DateTime.tryParse(data['dateReservation'] ?? '') ?? DateTime.now(),
+            heureDebut: data['heureDebut'] ?? '',
+            heureFin: data['heureFin'] ?? '',
+            raison: data['raison'] ?? '',
             statut: data['statut'] ?? 'En attente',
             dateCreation: (data['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
           );
@@ -1744,6 +1747,7 @@ class _HomePageState extends State<HomePage> {
         }
         
         print('📋 Réservations chargées depuis Firestore: ${_userReservations.length}');
+        if (mounted) setState(() {});
         return;
       }
       
@@ -1785,6 +1789,95 @@ class _HomePageState extends State<HomePage> {
     } catch (e) {
       debugPrint('Error loading user reservations: $e');
     }
+  }
+
+  /// Vérifie les créneaux indisponibles pour un stade à une date donnée
+  Future<List<Map<String, String>>> _getUnavailableSlots(String stadeId, DateTime date) async {
+    List<Map<String, String>> unavailableSlots = [];
+    
+    try {
+      // Vérifier dans Firestore pour les utilisateurs Firebase
+      final firestore = FirebaseFirestore.instance;
+      final dateStr = DateFormat('dd/MM/yyyy').format(date);
+      
+      final querySnapshot = await firestore
+          .collection('reservations')
+          .where('stadeId', isEqualTo: stadeId)
+          .where('dateReservation', isEqualTo: dateStr)
+          .where('statut', whereIn: ['En attente', 'Confirmée', 'en_attente', 'confirmee'])
+          .get();
+          
+      for (final doc in querySnapshot.docs) {
+        final data = doc.data();
+        unavailableSlots.add({
+          'debut': data['heureDebut'] ?? '',
+          'fin': data['heureFin'] ?? '',
+          'client': data['clientNom'] ?? 'Client',
+        });
+      }
+      
+      // Vérifier aussi dans SharedPreferences pour compatibilité
+      final prefs = await SharedPreferences.getInstance();
+      final requestIds = prefs.getStringList('reservation_requests') ?? [];
+      
+      for (final id in requestIds) {
+        final requestData = prefs.getString('request_$id');
+        if (requestData != null) {
+          final parts = requestData.split('|');
+          if (parts.length >= 9) {
+            final reservationDate = parts[3];
+            final reservationStade = parts[0];
+            final statut = parts[7];
+            
+            if (reservationStade == stadeId && 
+                reservationDate == dateStr && 
+                (statut == 'En attente' || statut == 'Confirmée')) {
+              unavailableSlots.add({
+                'debut': parts[4],
+                'fin': parts[5],
+                'client': parts[1],
+              });
+            }
+          }
+        }
+      }
+      
+      print('🚫 Créneaux indisponibles pour $stadeId le $dateStr: ${unavailableSlots.length}');
+    } catch (e) {
+      print('❌ Erreur lors de la vérification des créneaux: $e');
+    }
+    
+    return unavailableSlots;
+  }
+
+  /// Vérifie si un créneau est en conflit avec les réservations existantes
+  bool _isTimeSlotConflict(String newStart, String newEnd, List<Map<String, String>> unavailableSlots) {
+    for (final slot in unavailableSlots) {
+      final existingStart = slot['debut'] ?? '';
+      final existingEnd = slot['fin'] ?? '';
+      
+      // Convertir les heures en minutes pour la comparaison
+      final newStartMinutes = _timeToMinutes(newStart);
+      final newEndMinutes = _timeToMinutes(newEnd);
+      final existingStartMinutes = _timeToMinutes(existingStart);
+      final existingEndMinutes = _timeToMinutes(existingEnd);
+      
+      // Vérifier le chevauchement
+      if (newStartMinutes < existingEndMinutes && newEndMinutes > existingStartMinutes) {
+        return true; // Conflit détecté
+      }
+    }
+    return false;
+  }
+  
+  /// Convertit une heure (HH:mm) en minutes depuis minuit
+  int _timeToMinutes(String time) {
+    if (time.isEmpty) return 0;
+    final parts = time.split(':');
+    if (parts.length != 2) return 0;
+    final hours = int.tryParse(parts[0]) ?? 0;
+    final minutes = int.tryParse(parts[1]) ?? 0;
+    return hours * 60 + minutes;
   }
 
   Future<void> _loadManagerRequests() async {
@@ -1963,11 +2056,15 @@ class _HomePageState extends State<HomePage> {
               leading: const Icon(Icons.history),
               title: const Text('Mes Réservations'),
               selected: _selectedTab == 'historique',
-              onTap: () {
+              onTap: () async {
                 setState(() {
                   _selectedTab = 'historique';
                 });
                 Navigator.pop(context);
+                // Recharger automatiquement les réservations
+                if (_currentUserType == 'client') {
+                  await _loadUserReservations();
+                }
               },
             ),
           ] else ...[
@@ -2166,13 +2263,37 @@ class _HomePageState extends State<HomePage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                'Historique de vos Réservations',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.green,
-                ),
+              Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'Historique de vos Réservations',
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.green,
+                      ),
+                    ),
+                  ),
+                  ElevatedButton.icon(
+                    onPressed: () async {
+                      setState(() {
+                        _isLoading = true;
+                      });
+                      await _loadUserReservations();
+                      setState(() {
+                        _isLoading = false;
+                      });
+                    },
+                    icon: const Icon(Icons.refresh, size: 16),
+                    label: const Text('Actualiser'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.green,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    ),
+                  ),
+                ],
               ),
               const SizedBox(height: 8),
               Text(
@@ -2929,6 +3050,45 @@ class _ReservationDialogState extends State<ReservationDialog> {
           return;
         }
         
+        // Vérifier les conflits de créneaux horaires
+        final homeState = context.findAncestorStateOfType<_HomePageState>();
+        if (homeState != null) {
+          final unavailableSlots = await homeState._getUnavailableSlots(widget.stade['nom'], _dateReservation);
+          final hasConflict = homeState._isTimeSlotConflict(_heureDebut, _heureFin, unavailableSlots);
+          
+          if (hasConflict) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    'Ce créneau ($_heureDebut - $_heureFin) est déjà réservé pour cette date. '
+                    'Veuillez choisir un autre horaire.',
+                  ),
+                  backgroundColor: Colors.red,
+                  duration: const Duration(seconds: 5),
+                ),
+              );
+            }
+            return;
+          }
+          
+          // Afficher les créneaux indisponibles
+          if (unavailableSlots.isNotEmpty && mounted) {
+            final slotsText = unavailableSlots.map((slot) => 
+              '${slot['debut']} - ${slot['fin']}').join(', ');
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  'Créneaux déjà réservés: $slotsText',
+                  style: const TextStyle(fontSize: 12),
+                ),
+                backgroundColor: Colors.orange,
+                duration: const Duration(seconds: 3),
+              ),
+            );
+          }
+        }
+        
         final request = ReservationRequest(
           id: DateTime.now().millisecondsSinceEpoch.toString(),
           stadeId: widget.stade['nom'],
@@ -2951,9 +3111,7 @@ class _ReservationDialogState extends State<ReservationDialog> {
             'stadeNom': request.stadeNom,
             'clientNom': request.clientNom,
             'clientEmail': request.clientEmail,
-            'clientTelephone': _telephoneController.text.trim(),
             'dateReservation': DateFormat('dd/MM/yyyy').format(request.dateReservation),
-            'heureReservation': '${request.heureDebut} - ${request.heureFin}',
             'heureDebut': request.heureDebut,
             'heureFin': request.heureFin,
             'raison': request.raison,
@@ -2962,6 +3120,15 @@ class _ReservationDialogState extends State<ReservationDialog> {
           });
           
           print('💾 Réservation sauvegardée dans Firestore');
+          
+          // Notifier le HomeScreen pour recharger les données
+          if (context.mounted) {
+            final homeState = context.findAncestorStateOfType<_HomePageState>();
+            if (homeState != null) {
+              await homeState._loadUserReservations();
+              homeState.setState(() {});
+            }
+          }
         }
 
         // Fallback : SharedPreferences pour compatibilité
