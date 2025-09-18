@@ -1,13 +1,165 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
+import 'package:intl/date_symbol_data_local.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:firebase_storage/firebase_storage.dart';
+import 'package:image_picker/image_picker.dart';
+import 'dart:io';
+import 'dart:typed_data';
+import 'dart:async';
 import 'services/notification_service.dart';
 import 'services/app_lifecycle_service.dart';
+
+// === UTILITAIRES ===
+
+/// Utilitaire de chiffrement simple pour données sensibles
+class SecureStorage {
+  static const String _key = 'BkFt237SecK3y'; // Clé de chiffrement simple
+
+  /// Chiffre une chaîne avec XOR simple
+  static String _encrypt(String data) {
+    final keyBytes = _key.codeUnits;
+    final dataBytes = data.codeUnits;
+    final encrypted = <int>[];
+
+    for (int i = 0; i < dataBytes.length; i++) {
+      encrypted.add(dataBytes[i] ^ keyBytes[i % keyBytes.length]);
+    }
+
+    return encrypted.map((e) => e.toString().padLeft(3, '0')).join();
+  }
+
+  /// Déchiffre une chaîne chiffrée avec XOR
+  static String _decrypt(String encryptedData) {
+    try {
+      final parts = <String>[];
+      for (int i = 0; i < encryptedData.length; i += 3) {
+        parts.add(encryptedData.substring(i, i + 3));
+      }
+
+      final keyBytes = _key.codeUnits;
+      final decrypted = <int>[];
+
+      for (int i = 0; i < parts.length; i++) {
+        final encryptedByte = int.parse(parts[i]);
+        decrypted.add(encryptedByte ^ keyBytes[i % keyBytes.length]);
+      }
+
+      return String.fromCharCodes(decrypted);
+    } catch (e) {
+      return '';
+    }
+  }
+
+  /// Stocke une donnée sensible de façon sécurisée
+  static Future<void> setSecure(String key, String value) async {
+    final prefs = await SharedPreferences.getInstance();
+    final encrypted = _encrypt(value);
+    await prefs.setString('sec_$key', encrypted);
+  }
+
+  /// Récupère une donnée sensible stockée
+  static Future<String?> getSecure(String key) async {
+    final prefs = await SharedPreferences.getInstance();
+    final encrypted = prefs.getString('sec_$key');
+    if (encrypted == null) return null;
+    return _decrypt(encrypted);
+  }
+
+  /// Supprime une donnée sensible
+  static Future<void> removeSecure(String key) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('sec_$key');
+  }
+}
+
+/// Système de cache simple pour optimiser les performances
+class SimpleCache<T> {
+  final Map<String, _CacheEntry<T>> _cache = {};
+  final Duration _defaultTtl;
+
+  SimpleCache({Duration defaultTtl = const Duration(minutes: 5)})
+    : _defaultTtl = defaultTtl;
+
+  void set(String key, T value, {Duration? ttl}) {
+    final expiry = DateTime.now().add(ttl ?? _defaultTtl);
+    _cache[key] = _CacheEntry(value, expiry);
+  }
+
+  T? get(String key) {
+    final entry = _cache[key];
+    if (entry == null || entry.isExpired) {
+      _cache.remove(key);
+      return null;
+    }
+    return entry.value;
+  }
+
+  void clear() => _cache.clear();
+
+  void remove(String key) => _cache.remove(key);
+
+  bool contains(String key) {
+    final entry = _cache[key];
+    if (entry == null || entry.isExpired) {
+      _cache.remove(key);
+      return false;
+    }
+    return true;
+  }
+}
+
+class _CacheEntry<T> {
+  final T value;
+  final DateTime expiry;
+
+  _CacheEntry(this.value, this.expiry);
+
+  bool get isExpired => DateTime.now().isAfter(expiry);
+}
+
+/// Système de logging centralisé pour l'application
+class AppLogger {
+  static const bool _isDebugMode = false; // Changez à true pour debug
+  
+  static void debug(String message) {
+    if (_isDebugMode) {
+      print('🔍 DEBUG: $message');
+    }
+  }
+
+  /// Log sécurisé pour tokens/données sensibles
+  static void secureInfo(String message, String? sensitiveData) {
+    if (_isDebugMode) {
+      print('🔒 SECURE: $message ${sensitiveData ?? '[MASKED]'}');
+    } else {
+      print('🔒 SECURE: $message [MASKED]');
+    }
+  }
+  
+  static void info(String message) {
+    print('ℹ️ INFO: $message');
+  }
+  
+  static void warning(String message) {
+    print('⚠️ WARNING: $message');
+  }
+  
+  static void error(String message, [dynamic error]) {
+    print('❌ ERROR: $message${error != null ? ' - $error' : ''}');
+  }
+  
+  static void success(String message) {
+    print('✅ SUCCESS: $message');
+  }
+}
+
+// === SERVICES FIREBASE ===
 
 // Service Firebase Authentication avec messaging
 class FirebaseAuthService {
@@ -60,9 +212,25 @@ class FirebaseAuthService {
       }
       
       return result;
+    } on FirebaseAuthException catch (e) {
+      switch (e.code) {
+        case 'email-already-in-use':
+          throw 'Cet email est déjà utilisé par un autre compte';
+        case 'invalid-email':
+          throw 'Format email invalide';
+        case 'operation-not-allowed':
+          throw 'Inscription par email/mot de passe désactivée';
+        case 'weak-password':
+          throw 'Mot de passe trop faible. Minimum 6 caractères';
+        case 'network-request-failed':
+          throw 'Erreur réseau. Vérifiez votre connexion internet';
+        default:
+          throw 'Erreur d\'inscription: ${e.message ?? e.code}';
+      }
+    } on FirebaseException catch (e) {
+      throw 'Erreur Firestore: ${e.message ?? e.code}';
     } catch (e) {
-      print('Erreur inscription: $e');
-      return null;
+      throw 'Erreur inattendue lors de l\'inscription: $e';
     }
   }
   
@@ -74,9 +242,25 @@ class FirebaseAuthService {
         password: password
       );
       return result;
+    } on FirebaseAuthException catch (e) {
+      switch (e.code) {
+        case 'user-not-found':
+          throw 'Aucun utilisateur trouvé avec cet email';
+        case 'wrong-password':
+          throw 'Mot de passe incorrect';
+        case 'invalid-email':
+          throw 'Format email invalide';
+        case 'user-disabled':
+          throw 'Ce compte utilisateur a été désactivé';
+        case 'too-many-requests':
+          throw 'Trop de tentatives. Veuillez réessayer plus tard';
+        case 'network-request-failed':
+          throw 'Erreur réseau. Vérifiez votre connexion internet';
+        default:
+          throw 'Erreur de connexion: ${e.message ?? e.code}';
+      }
     } catch (e) {
-      print('Erreur connexion: $e');
-      return null;
+      throw 'Erreur inattendue: $e';
     }
   }
   
@@ -130,7 +314,7 @@ class FirebaseAuthService {
       // Obtenir le token FCM
       String? token = await _messaging.getToken();
       if (token != null) {
-        print('FCM Token: $token');
+        AppLogger.secureInfo('FCM Token obtenu', token);
         // Sauvegarder le token dans Firestore pour l'utilisateur connecté
         if (currentUser != null) {
           await _firestore.collection('users').doc(currentUser!.uid).update({
@@ -207,31 +391,438 @@ class ReservationRequest {
     'dateCreation': dateCreation.toIso8601String(),
   };
   
-  static ReservationRequest fromJson(Map<String, dynamic> json) => ReservationRequest(
-    id: json['id'],
-    stadeId: json['stadeId'],
-    stadeNom: json['stadeNom'],
-    clientNom: json['clientNom'],
-    clientEmail: json['clientEmail'],
-    dateReservation: DateTime.parse(json['dateReservation']),
-    heureDebut: json['heureDebut'],
-    heureFin: json['heureFin'],
-    raison: json['raison'],
-    statut: json['statut'],
-    dateCreation: DateTime.parse(json['dateCreation']),
-  );
+  static ReservationRequest fromJson(Map<String, dynamic> json) {
+    DateTime parseDate(dynamic dateValue, DateTime defaultValue) {
+      try {
+        if (dateValue == null) return defaultValue;
+        if (dateValue is String) {
+          if (dateValue.isEmpty) return defaultValue;
+          return DateTime.parse(dateValue);
+        }
+        if (dateValue is Timestamp) {
+          return dateValue.toDate();
+        }
+        return defaultValue;
+      } catch (e) {
+        print('❌ Erreur parsing date: $dateValue - $e');
+        return defaultValue;
+      }
+    }
+
+    return ReservationRequest(
+      id: json['id'] ?? '',
+      stadeId: json['stadeId'] ?? '',
+      stadeNom: json['stadeNom'] ?? '',
+      clientNom: json['clientNom'] ?? '',
+      clientEmail: json['clientEmail'] ?? '',
+      dateReservation: parseDate(json['dateReservation'], DateTime.now()),
+      heureDebut: json['heureDebut'] ?? '',
+      heureFin: json['heureFin'] ?? '',
+      raison: json['raison'] ?? '',
+      statut: json['statut'] ?? 'en_attente',
+      dateCreation: parseDate(json['dateCreation'], DateTime.now()),
+    );
+  }
+}
+
+// Classe pour validation des formulaires
+class FormValidators {
+  static String? validateEmail(String? value) {
+    if (value == null || value.isEmpty) {
+      return 'Email requis';
+    }
+
+    // Validation avancée avec plusieurs critères
+    final trimmedValue = value.trim();
+
+    // Vérification longueur
+    if (trimmedValue.length < 5 || trimmedValue.length > 254) {
+      return 'Email doit faire entre 5 et 254 caractères';
+    }
+
+    // Regex robuste pour email (simplifiée)
+    final emailRegex = RegExp(
+      r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$',
+    );
+
+    if (!emailRegex.hasMatch(trimmedValue)) {
+      return 'Format email invalide';
+    }
+
+    // Vérifications supplémentaires
+    if (trimmedValue.startsWith('.') || trimmedValue.endsWith('.')) {
+      return 'Email ne peut pas commencer ou finir par un point';
+    }
+
+    if (trimmedValue.contains('..')) {
+      return 'Email ne peut pas contenir de points consécutifs';
+    }
+
+    final parts = trimmedValue.split('@');
+    if (parts.length != 2) {
+      return 'Email doit contenir exactement un @';
+    }
+
+    final localPart = parts[0];
+    final domainPart = parts[1];
+
+    if (localPart.length > 64) {
+      return 'Partie locale de l\'email trop longue';
+    }
+
+    if (domainPart.isEmpty || domainPart.length > 253) {
+      return 'Domaine email invalide';
+    }
+
+    return null;
+  }
+
+  static String? validatePassword(String? value) {
+    if (value == null || value.isEmpty) {
+      return 'Mot de passe requis';
+    }
+    if (value.length < 6) {
+      return 'Minimum 6 caractères';
+    }
+    if (!RegExp(r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)').hasMatch(value)) {
+      return 'Doit contenir au moins: 1 majuscule, 1 minuscule, 1 chiffre';
+    }
+    return null;
+  }
+
+  static String? validateName(String? value) {
+    if (value == null || value.isEmpty) {
+      return 'Nom requis';
+    }
+    if (value.length < 2) {
+      return 'Nom trop court (minimum 2 caractères)';
+    }
+    if (!RegExp(r'^[a-zA-Z\s\u00C0-\u017F]+$').hasMatch(value)) {
+      return 'Le nom ne peut contenir que des lettres et espaces';
+    }
+    return null;
+  }
+
+  static String? validatePhoneNumber(String? value) {
+    if (value == null || value.isEmpty) {
+      return 'Numéro de téléphone requis';
+    }
+    // Format camerounais: +237XXXXXXXXX ou 6XXXXXXXX
+    if (!RegExp(r'^(\+237)?[6][0-9]{8}$').hasMatch(value.replaceAll(' ', ''))) {
+      return 'Format invalide (ex: +237612345678 ou 612345678)';
+    }
+    return null;
+  }
+
+  static String? validateRequired(String? value, String fieldName) {
+    if (value == null || value.trim().isEmpty) {
+      return '$fieldName requis';
+    }
+    return null;
+  }
+
+  static String? validateTime(String? value) {
+    if (value == null || value.isEmpty) {
+      return 'Heure requise';
+    }
+    // Format HH:MM
+    if (!RegExp(r'^([01]?[0-9]|2[0-3]):[0-5][0-9]$').hasMatch(value)) {
+      return 'Format invalide (ex: 14:30)';
+    }
+    return null;
+  }
+}
+
+// === GESTION DES STADES ===
+
+/// Classe pour représenter un stade avec toutes ses informations
+class Stadium {
+  final String id;
+  final String nom;
+  final String adresse;
+  final String quartier;
+  final int prix;
+  final String type;
+  final String capacite;
+  final bool disponible;
+  final String description;
+  final String gestionnaire;
+  final List<String> images;
+  final Map<String, dynamic> horaires;
+  final DateTime dateCreation;
+  final Map<String, dynamic> amenities;
+
+  Stadium({
+    required this.id,
+    required this.nom,
+    required this.adresse,
+    required this.quartier,
+    required this.prix,
+    required this.type,
+    required this.capacite,
+    this.disponible = true,
+    required this.description,
+    required this.gestionnaire,
+    this.images = const [],
+    Map<String, dynamic>? horaires,
+    DateTime? dateCreation,
+    this.amenities = const {},
+  }) : horaires = horaires ?? _defaultSchedule(),
+       dateCreation = dateCreation ?? DateTime.now();
+
+  static Map<String, dynamic> _defaultSchedule() {
+    return {
+      'lundi': {'ouvert': true, 'debut': '06:00', 'fin': '22:00'},
+      'mardi': {'ouvert': true, 'debut': '06:00', 'fin': '22:00'},
+      'mercredi': {'ouvert': true, 'debut': '06:00', 'fin': '22:00'},
+      'jeudi': {'ouvert': true, 'debut': '06:00', 'fin': '22:00'},
+      'vendredi': {'ouvert': true, 'debut': '06:00', 'fin': '22:00'},
+      'samedi': {'ouvert': true, 'debut': '06:00', 'fin': '22:00'},
+      'dimanche': {'ouvert': true, 'debut': '08:00', 'fin': '20:00'},
+    };
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id,
+      'nom': nom,
+      'adresse': adresse,
+      'quartier': quartier,
+      'prix': prix,
+      'type': type,
+      'capacite': capacite,
+      'disponible': disponible,
+      'description': description,
+      'gestionnaire': gestionnaire,
+      'images': images,
+      'horaires': horaires,
+      'dateCreation': dateCreation.toIso8601String(),
+      'amenities': amenities,
+    };
+  }
+
+  factory Stadium.fromMap(Map<String, dynamic> map) {
+    return Stadium(
+      id: map['id'] ?? '',
+      nom: map['nom'] ?? '',
+      adresse: map['adresse'] ?? '',
+      quartier: map['quartier'] ?? '',
+      prix: map['prix'] ?? 0,
+      type: map['type'] ?? '',
+      capacite: map['capacite'] ?? '',
+      disponible: map['disponible'] ?? true,
+      description: map['description'] ?? '',
+      gestionnaire: map['gestionnaire'] ?? '',
+      images: List<String>.from(map['images'] ?? []),
+      horaires: Map<String, dynamic>.from(map['horaires'] ?? _defaultSchedule()),
+      dateCreation: map['dateCreation'] != null
+          ? DateTime.parse(map['dateCreation'])
+          : DateTime.now(),
+      amenities: Map<String, dynamic>.from(map['amenities'] ?? {}),
+    );
+  }
+}
+
+/// Service pour gérer l'upload d'images vers Firebase Storage
+class ImageUploadService {
+  static final FirebaseStorage _storage = FirebaseStorage.instance;
+  static final ImagePicker _picker = ImagePicker();
+
+  /// Upload une image vers Firebase Storage
+  static Future<String?> uploadImage(XFile imageFile, String stadiumId) async {
+    try {
+      final String fileName = '${DateTime.now().millisecondsSinceEpoch}_${imageFile.name}';
+      final Reference ref = _storage.ref().child('stadiums/$stadiumId/$fileName');
+
+      final Uint8List imageData = await imageFile.readAsBytes();
+      final UploadTask uploadTask = ref.putData(imageData);
+
+      final TaskSnapshot snapshot = await uploadTask;
+      final String downloadUrl = await snapshot.ref.getDownloadURL();
+
+      AppLogger.info('Image uploadée avec succès: $downloadUrl');
+      return downloadUrl;
+    } catch (e) {
+      AppLogger.error('Erreur lors de l\'upload d\'image: $e');
+      return null;
+    }
+  }
+
+  /// Sélectionner et uploader plusieurs images
+  static Future<List<String>> selectAndUploadImages(String stadiumId, {int maxImages = 5}) async {
+    try {
+      print('🖼️ ImageUploadService.selectAndUploadImages appelé pour stadiumId: $stadiumId');
+      final List<XFile> imageFiles = await _picker.pickMultiImage(
+        maxWidth: 1920,
+        maxHeight: 1080,
+        imageQuality: 80,
+      );
+
+      print('📷 Images sélectionnées: ${imageFiles.length}');
+
+      if (imageFiles.isEmpty) {
+        print('⚠️ Aucune image sélectionnée par l\'utilisateur');
+        return [];
+      }
+
+      // Limiter le nombre d'images
+      final List<XFile> limitedFiles = imageFiles.take(maxImages).toList();
+      final List<String> uploadedUrls = [];
+
+      print('⬆️ Début upload de ${limitedFiles.length} images...');
+
+      for (int i = 0; i < limitedFiles.length; i++) {
+        final XFile imageFile = limitedFiles[i];
+        print('⬆️ Upload image ${i + 1}/${limitedFiles.length}: ${imageFile.name}');
+
+        final String? url = await uploadImage(imageFile, stadiumId);
+        if (url != null) {
+          uploadedUrls.add(url);
+          print('✅ Image ${i + 1} uploadée: $url');
+        } else {
+          print('❌ Échec upload image ${i + 1}');
+        }
+      }
+
+      print('🎉 Upload terminé. ${uploadedUrls.length}/${limitedFiles.length} images uploadées');
+      print('📋 URLs finales: $uploadedUrls');
+      return uploadedUrls;
+    } catch (e) {
+      print('❌ Erreur lors de la sélection d\'images: $e');
+      AppLogger.error('Erreur lors de la sélection d\'images: $e');
+      return [];
+    }
+  }
+
+  /// Prendre une photo avec la caméra
+  static Future<String?> takeAndUploadPhoto(String stadiumId) async {
+    try {
+      final XFile? imageFile = await _picker.pickImage(
+        source: ImageSource.camera,
+        maxWidth: 1920,
+        maxHeight: 1080,
+        imageQuality: 80,
+      );
+
+      if (imageFile == null) return null;
+
+      return await uploadImage(imageFile, stadiumId);
+    } catch (e) {
+      AppLogger.error('Erreur lors de la prise de photo: $e');
+      return null;
+    }
+  }
+
+  /// Supprimer une image de Firebase Storage
+  static Future<bool> deleteImage(String imageUrl) async {
+    try {
+      final Reference ref = FirebaseStorage.instance.refFromURL(imageUrl);
+      await ref.delete();
+      AppLogger.info('Image supprimée avec succès: $imageUrl');
+      return true;
+    } catch (e) {
+      AppLogger.error('Erreur lors de la suppression d\'image: $e');
+      return false;
+    }
+  }
+}
+
+/// Service pour gérer les stades dans Firebase
+class StadiumService {
+  static final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  static const String _collection = 'stadiums';
+
+  /// Créer un nouveau stade
+  static Future<String?> createStadium(Stadium stadium) async {
+    try {
+      final DocumentReference docRef = await _firestore.collection(_collection).add(stadium.toMap());
+      AppLogger.info('Stade créé avec succès: ${docRef.id}');
+      return docRef.id;
+    } catch (e) {
+      AppLogger.error('Erreur lors de la création du stade: $e');
+      return null;
+    }
+  }
+
+  /// Mettre à jour un stade existant
+  static Future<bool> updateStadium(String stadiumId, Stadium stadium) async {
+    try {
+      await _firestore.collection(_collection).doc(stadiumId).update(stadium.toMap());
+      AppLogger.info('Stade mis à jour avec succès: $stadiumId');
+      return true;
+    } catch (e) {
+      AppLogger.error('Erreur lors de la mise à jour du stade: $e');
+      return false;
+    }
+  }
+
+  /// Récupérer tous les stades
+  static Future<List<Stadium>> getAllStadiums() async {
+    try {
+      final QuerySnapshot snapshot = await _firestore.collection(_collection)
+          .where('disponible', isEqualTo: true)
+          .orderBy('dateCreation', descending: true)
+          .get();
+
+      return snapshot.docs.map((doc) {
+        final data = doc.data() as Map<String, dynamic>;
+        data['id'] = doc.id;
+        return Stadium.fromMap(data);
+      }).toList();
+    } catch (e) {
+      AppLogger.error('Erreur lors de la récupération des stades: $e');
+      return [];
+    }
+  }
+
+  /// Récupérer les stades d'un gestionnaire
+  static Future<List<Stadium>> getStadiumsByManager(String managerEmail) async {
+    try {
+      final QuerySnapshot snapshot = await _firestore.collection(_collection)
+          .where('gestionnaire', isEqualTo: managerEmail)
+          .orderBy('dateCreation', descending: true)
+          .get();
+
+      return snapshot.docs.map((doc) {
+        final data = doc.data() as Map<String, dynamic>;
+        data['id'] = doc.id;
+        return Stadium.fromMap(data);
+      }).toList();
+    } catch (e) {
+      AppLogger.error('Erreur lors de la récupération des stades du gestionnaire: $e');
+      return [];
+    }
+  }
+
+  /// Stream pour écouter les changements en temps réel
+  static Stream<List<Stadium>> getStadiumsStream() {
+    return _firestore.collection(_collection)
+        .where('disponible', isEqualTo: true)
+        .orderBy('dateCreation', descending: true)
+        .snapshots()
+        .map((snapshot) {
+      return snapshot.docs.map((doc) {
+        final data = doc.data();
+        data['id'] = doc.id;
+        return Stadium.fromMap(data);
+      }).toList();
+    });
+  }
 }
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp();
-  
+
+  // Initialiser les données de localisation française
+  await initializeDateFormatting('fr_FR');
+
   // Initialiser Firebase Cloud Messaging
   await FirebaseAuthService.instance.initializeMessaging();
-  
+
   // Initialiser le service de cycle de vie pour empêcher l'auto-destruction
   AppLifecycleService().initialize();
-  
+
   runApp(const BookFootApp());
 }
 
@@ -704,6 +1295,8 @@ class _LoginPageState extends State<LoginPage> {
   void dispose() {
     _emailController.dispose();
     _passwordController.dispose();
+    _phoneController.dispose();
+    _otpController.dispose();
     super.dispose();
   }
 }
@@ -726,11 +1319,15 @@ class _RegisterPageState extends State<RegisterPage> {
   final _stadeNomController = TextEditingController();
   final _stadeAdresseController = TextEditingController();
   final _stadePrixController = TextEditingController();
-  
+
   String _userType = 'client';
   String _stadeCapacite = '11v11';
   String _stadeType = 'Terrain en herbe naturelle';
   String _verificationType = 'email'; // 'email' ou 'phone'
+
+  // Variables pour l'upload d'images du stade
+  List<String> _stadeImages = [];
+  bool _isUploadingImages = false;
   bool _isOtpSent = false;
   bool _isOtpVerified = false;
   String _verificationId = '';
@@ -760,12 +1357,15 @@ class _RegisterPageState extends State<RegisterPage> {
       if (otpCode != null) {
         // Stocker le code et l'heure pour vérification
         final prefs = await SharedPreferences.getInstance();
-        await prefs.setString('otp_${_emailController.text}', otpCode);
+        await SecureStorage.setSecure('otp_${_emailController.text}', otpCode);
         await prefs.setInt('otp_time_${_emailController.text}', DateTime.now().millisecondsSinceEpoch);
-        
-        setState(() {
-          _isOtpSent = true;
-        });
+        AppLogger.secureInfo('Code OTP stocké de façon sécurisée', otpCode);
+
+        if (mounted) {
+          setState(() {
+            _isOtpSent = true;
+          });
+        }
         
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -780,12 +1380,15 @@ class _RegisterPageState extends State<RegisterPage> {
         final fallbackCode = random.toString();
         
         final prefs = await SharedPreferences.getInstance();
-        await prefs.setString('otp_${_emailController.text}', fallbackCode);
+        await SecureStorage.setSecure('otp_${_emailController.text}', fallbackCode);
         await prefs.setInt('otp_time_${_emailController.text}', DateTime.now().millisecondsSinceEpoch);
-        
-        setState(() {
-          _isOtpSent = true;
-        });
+        AppLogger.secureInfo('Code OTP fallback stocké de façon sécurisée', fallbackCode);
+
+        if (mounted) {
+          setState(() {
+            _isOtpSent = true;
+          });
+        }
         
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -884,7 +1487,7 @@ class _RegisterPageState extends State<RegisterPage> {
     if (_verificationType == 'email') {
       try {
         final prefs = await SharedPreferences.getInstance();
-        final storedCode = prefs.getString('otp_${_emailController.text}');
+        final storedCode = await SecureStorage.getSecure('otp_${_emailController.text}');
         final codeTime = prefs.getInt('otp_time_${_emailController.text}');
         
         if (storedCode == null || codeTime == null) {
@@ -910,13 +1513,16 @@ class _RegisterPageState extends State<RegisterPage> {
         }
         
         if (_otpController.text.trim() == storedCode) {
-          setState(() {
-            _isOtpVerified = true;
-          });
+          if (mounted) {
+            setState(() {
+              _isOtpVerified = true;
+            });
+          }
           
           // Supprimer le code utilisé
-          prefs.remove('otp_${_emailController.text}');
+          await SecureStorage.removeSecure('otp_${_emailController.text}');
           prefs.remove('otp_time_${_emailController.text}');
+          AppLogger.info('Code OTP validé et supprimé de façon sécurisée');
           
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
@@ -951,10 +1557,12 @@ class _RegisterPageState extends State<RegisterPage> {
         // Tester la validité du credential
         await FirebaseAuth.instance.signInWithCredential(credential);
         await FirebaseAuth.instance.signOut(); // Se déconnecter immédiatement
-        
-        setState(() {
-          _isOtpVerified = true;
-        });
+
+        if (mounted) {
+          setState(() {
+            _isOtpVerified = true;
+          });
+        }
         
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -973,125 +1581,362 @@ class _RegisterPageState extends State<RegisterPage> {
     }
   }
 
-  Future<void> _handleRegister() async {
-    if (_formKey.currentState!.validate()) {
-      if (_passwordController.text != _confirmPasswordController.text) {
+  // === FONCTIONS UPLOAD D'IMAGES ===
+
+  /// Sélectionner et uploader des images du stade
+  Future<void> _selectStadiumImages() async {
+    print('📱 _selectStadiumImages appelé');
+    if (_isUploadingImages) {
+      print('⚠️ Upload déjà en cours, retour');
+      return;
+    }
+
+    print('🔄 Début de l\'upload d\'images');
+    setState(() {
+      _isUploadingImages = true;
+    });
+
+    try {
+      // Créer un ID temporaire pour le stade
+      final String tempStadiumId = 'temp_${DateTime.now().millisecondsSinceEpoch}';
+      print('🆔 ID temporaire créé: $tempStadiumId');
+
+      // Sélectionner et uploader les images
+      print('📂 Appel à ImageUploadService.selectAndUploadImages...');
+      final List<String> uploadedUrls = await ImageUploadService.selectAndUploadImages(
+        tempStadiumId,
+        maxImages: 5
+      );
+
+      print('✅ URLs reçues: $uploadedUrls (${uploadedUrls.length} images)');
+
+      if (uploadedUrls.isNotEmpty) {
+        print('💾 Mise à jour de l\'état avec ${uploadedUrls.length} nouvelles images');
+        setState(() {
+          _stadeImages.addAll(uploadedUrls);
+        });
+
+        print('🎉 Nouvel état _stadeImages: $_stadeImages (${_stadeImages.length} total)');
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('${uploadedUrls.length} image(s) ajoutée(s) avec succès'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      } else {
+        print('⚠️ Aucune URL d\'image reçue');
+      }
+    } catch (e) {
+      print('❌ Erreur lors de l\'upload: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Erreur lors de l\'upload: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } finally {
+      print('🔚 Fin de l\'upload, _isUploadingImages = false');
+      setState(() {
+        _isUploadingImages = false;
+      });
+    }
+  }
+
+  /// Prendre une photo avec la caméra
+  Future<void> _takeStadiumPhoto() async {
+    if (_isUploadingImages) return;
+
+    setState(() {
+      _isUploadingImages = true;
+    });
+
+    try {
+      final String tempStadiumId = 'temp_${DateTime.now().millisecondsSinceEpoch}';
+
+      final String? photoUrl = await ImageUploadService.takeAndUploadPhoto(tempStadiumId);
+
+      if (photoUrl != null) {
+        setState(() {
+          _stadeImages.add(photoUrl);
+        });
+
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('Les mots de passe ne correspondent pas'),
+            content: Text('Photo ajoutée avec succès'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Erreur lors de la prise de photo: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } finally {
+      setState(() {
+        _isUploadingImages = false;
+      });
+    }
+  }
+
+  /// Supprimer une image de la liste
+  void _removeStadiumImage(int index) {
+    if (index >= 0 && index < _stadeImages.length) {
+      setState(() {
+        _stadeImages.removeAt(index);
+      });
+    }
+  }
+
+  /// Widget pour afficher les images sélectionnées
+  Widget _buildImagePreview() {
+    print('🖼️ _buildImagePreview appelé - Nombre d\'images: ${_stadeImages.length}');
+    print('🖼️ Images dans la liste: $_stadeImages');
+
+    if (_stadeImages.isEmpty) {
+      return Container(
+        height: 120,
+        decoration: BoxDecoration(
+          border: Border.all(color: Colors.grey.shade300),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: const Center(
+          child: Text(
+            'Aucune image sélectionnée',
+            style: TextStyle(color: Colors.grey),
+          ),
+        ),
+      );
+    }
+
+    return Container(
+      height: 120,
+      child: ListView.builder(
+        scrollDirection: Axis.horizontal,
+        itemCount: _stadeImages.length,
+        itemBuilder: (context, index) {
+          return Container(
+            width: 120,
+            margin: const EdgeInsets.only(right: 8),
+            child: Stack(
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: Image.network(
+                    _stadeImages[index],
+                    width: 120,
+                    height: 120,
+                    fit: BoxFit.cover,
+                    errorBuilder: (context, error, stackTrace) {
+                      return Container(
+                        width: 120,
+                        height: 120,
+                        color: Colors.grey.shade200,
+                        child: const Icon(Icons.error, color: Colors.red),
+                      );
+                    },
+                  ),
+                ),
+                Positioned(
+                  top: 4,
+                  right: 4,
+                  child: GestureDetector(
+                    onTap: () => _removeStadiumImage(index),
+                    child: Container(
+                      padding: const EdgeInsets.all(4),
+                      decoration: const BoxDecoration(
+                        color: Colors.red,
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(
+                        Icons.close,
+                        color: Colors.white,
+                        size: 16,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  /// Nouvelle fonction d'inscription avec validation améliorée
+  Future<void> _handleRegister() async {
+    // Validation du formulaire
+    if (!_formKey.currentState!.validate()) {
+      return;
+    }
+
+    // Vérification des mots de passe
+    if (_passwordController.text != _confirmPasswordController.text) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Les mots de passe ne correspondent pas'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    // Vérification de la force du mot de passe
+    if (_passwordController.text.length < 6) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Le mot de passe doit contenir au moins 6 caractères'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    try {
+      // Vérifier si l'email existe déjà
+      final List<String> signInMethods = await FirebaseAuth.instance
+          .fetchSignInMethodsForEmail(_emailController.text.trim());
+
+      if (signInMethods.isNotEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Cette adresse email est déjà utilisée'),
             backgroundColor: Colors.red,
           ),
         );
         return;
       }
 
-      if (!_isOtpVerified) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Vous devez vérifier votre email ou téléphone avant de créer le compte'),
-            backgroundColor: Colors.orange,
-          ),
-        );
-        return;
-      }
-      
-      try {
-        print('🚀 Début création compte pour ${_emailController.text.trim()}');
-        
-        // Register with Firebase
-        UserCredential? result = await FirebaseAuthService.instance.registerWithEmailAndPassword(
-          _emailController.text.trim(),
-          _passwordController.text,
-          _nomController.text.trim(),
-          _userType,
-        );
-        
-        print('✅ Résultat Firebase Auth: ${result != null ? "Succès" : "Échec"}');
-        
-        if (result != null) {
-          // Save additional user data to Firestore
-          Map<String, dynamic> userData = {
-            'name': _nomController.text.trim(),
-            'email': _emailController.text.trim(),
-            'userType': _userType,
-            'createdAt': DateTime.now().toIso8601String(),
-          };
+      // Validation spécifique pour les gestionnaires
+      if (_userType == 'gestionnaire') {
+        if (_stadeNomController.text.trim().isEmpty ||
+            _stadeAdresseController.text.trim().isEmpty ||
+            _stadePrixController.text.trim().isEmpty) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Veuillez remplir toutes les informations du stade'),
+              backgroundColor: Colors.red,
+            ),
+          );
+          return;
+        }
 
-          // Ajouter téléphone pour les clients
-          if (_userType == 'client' && _telephoneController.text.isNotEmpty) {
-            String phoneNumber = _telephoneController.text.trim();
-            if (!phoneNumber.startsWith('+237')) {
-              phoneNumber = '+237$phoneNumber';
-            }
-            userData['telephone'] = phoneNumber;
-          }
-          
-          // Add stadium data if user is manager
-          if (_userType == 'gestionnaire') {
-            userData['stade'] = {
-              'nom': _stadeNomController.text.trim(),
-              'adresse': _stadeAdresseController.text.trim(),
-              'prix': int.parse(_stadePrixController.text),
-              'capacite': _stadeCapacite,
-              'type': _stadeType,
-              'disponible': true,
-              'description': 'Stade géré par ${_nomController.text.trim()}',
-            };
-          }
-          
-          // Save to Firestore
-          print('💾 Sauvegarde données utilisateur dans Firestore...');
-          await FirebaseFirestore.instance
-              .collection('users')
-              .doc(result.user!.uid)
-              .set(userData);
-          
-          print('✅ Compte créé avec succès ! Redirection vers login...');
-          
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('Compte créé avec succès! Connectez-vous maintenant avec ${_emailController.text}'),
-                backgroundColor: Colors.green,
-                duration: const Duration(seconds: 4),
-                action: SnackBarAction(
-                  label: 'Connexion',
-                  textColor: Colors.white,
-                  onPressed: () => context.go('/login'),
-                ),
-              ),
-            );
-            context.go('/login');
-          }
-        }
-      } on FirebaseAuthException catch (e) {
-        String errorMessage = 'Erreur d\'inscription';
-        switch (e.code) {
-          case 'weak-password':
-            errorMessage = 'Le mot de passe est trop faible';
-            break;
-          case 'email-already-in-use':
-            errorMessage = 'Cet email est déjà utilisé';
-            break;
-          case 'invalid-email':
-            errorMessage = 'Email invalide';
-            break;
-          default:
-            errorMessage = 'Erreur: ${e.message}';
-        }
-        
-        if (mounted) {
+        if (int.tryParse(_stadePrixController.text.trim()) == null) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(errorMessage), backgroundColor: Colors.red),
+            const SnackBar(
+              content: Text('Le prix doit être un nombre valide'),
+              backgroundColor: Colors.red,
+            ),
           );
+          return;
         }
-      } catch (e) {
+      }
+
+      // Toutes les validations passées, préparer les données utilisateur
+      Map<String, dynamic> userData = {
+        'fullName': _nomController.text.trim(),
+        'email': _emailController.text.trim(),
+        'userType': _userType,
+        'createdAt': DateTime.now().toIso8601String(),
+        'password': _passwordController.text, // Temporaire, sera supprimé avant sauvegarde
+      };
+
+      // Ajouter téléphone pour les clients
+      if (_userType == 'client' && _telephoneController.text.isNotEmpty) {
+        String phoneNumber = _telephoneController.text.trim();
+        if (!phoneNumber.startsWith('+237')) {
+          phoneNumber = '+237$phoneNumber';
+        }
+        userData['telephone'] = phoneNumber;
+      }
+
+      // Ajouter données du stade si gestionnaire
+      if (_userType == 'gestionnaire') {
+        userData['stade'] = {
+          'nom': _stadeNomController.text.trim(),
+          'adresse': _stadeAdresseController.text.trim(),
+          'prix': int.parse(_stadePrixController.text.trim()),
+          'capacite': _stadeCapacite,
+          'type': _stadeType,
+          'disponible': true,
+          'description': 'Stade géré par ${_nomController.text.trim()}',
+          'images': _stadeImages,
+          'quartier': _stadeAdresseController.text.trim().split(',').first.trim(),
+          'gestionnaire': _emailController.text.trim(),
+          'dateCreation': DateTime.now().toIso8601String(),
+        };
+      }
+
+      // Créer le compte Firebase directement
+      UserCredential result = await FirebaseAuth.instance.createUserWithEmailAndPassword(
+        email: _emailController.text.trim(),
+        password: _passwordController.text,
+      );
+
+      if (result.user != null) {
+        // Supprimer le mot de passe des données à sauvegarder
+        final Map<String, dynamic> dataToSave = Map<String, dynamic>.from(userData);
+        dataToSave.remove('password');
+
+        // Sauvegarder les données utilisateur dans Firestore
+        await FirebaseFirestore.instance
+            .collection('users')
+            .doc(result.user!.uid)
+            .set(dataToSave);
+
+        // Si c'est un gestionnaire, créer aussi le document du stade
+        if (_userType == 'gestionnaire' && userData['stade'] != null) {
+          await FirebaseFirestore.instance
+              .collection('stadiums')
+              .add(userData['stade']);
+        }
+
+        // Rediriger vers la page de succès
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Erreur: $e'), backgroundColor: Colors.red),
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(
+              builder: (context) => RegistrationSuccessPage(
+                email: _emailController.text.trim(),
+                userType: _userType,
+              ),
+            ),
           );
         }
       }
+
+    } on FirebaseAuthException catch (e) {
+      String errorMessage = 'Erreur lors de la validation des données';
+      switch (e.code) {
+        case 'invalid-email':
+          errorMessage = 'Adresse email invalide';
+          break;
+        case 'network-request-failed':
+          errorMessage = 'Problème de connexion internet';
+          break;
+        case 'too-many-requests':
+          errorMessage = 'Trop de tentatives. Veuillez réessayer plus tard';
+          break;
+        default:
+          errorMessage = 'Erreur: ${e.message}';
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(errorMessage),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Erreur inattendue: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
     }
   }
 
@@ -1186,11 +2031,7 @@ class _RegisterPageState extends State<RegisterPage> {
                         prefixIcon: const Icon(Icons.email),
                         border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                       ),
-                      validator: (value) {
-                        if (value?.isEmpty == true) return 'Email requis';
-                        if (!value!.contains('@')) return 'Email invalide';
-                        return null;
-                      },
+                      validator: FormValidators.validateEmail,
                     ),
                     const SizedBox(height: 16),
                     
@@ -1445,7 +2286,59 @@ class _RegisterPageState extends State<RegisterPage> {
                               },
                             ),
                             const SizedBox(height: 16),
-                            
+
+                            // Section upload d'images
+                            const Text(
+                              'Photos du stade',
+                              style: TextStyle(fontWeight: FontWeight.w600, fontSize: 16),
+                            ),
+                            const SizedBox(height: 8),
+                            const Text(
+                              'Ajoutez des photos pour présenter votre stade (optionnel)',
+                              style: TextStyle(color: Colors.grey, fontSize: 13),
+                            ),
+                            const SizedBox(height: 12),
+
+                            // Aperçu des images
+                            _buildImagePreview(),
+                            const SizedBox(height: 12),
+
+                            // Boutons d'upload
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: ElevatedButton.icon(
+                                    onPressed: _isUploadingImages ? null : _selectStadiumImages,
+                                    icon: _isUploadingImages
+                                      ? const SizedBox(
+                                          width: 16,
+                                          height: 16,
+                                          child: CircularProgressIndicator(strokeWidth: 2),
+                                        )
+                                      : const Icon(Icons.photo_library),
+                                    label: Text(_isUploadingImages ? 'Upload...' : 'Galerie'),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.blue.shade50,
+                                      foregroundColor: Colors.blue.shade700,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: ElevatedButton.icon(
+                                    onPressed: _isUploadingImages ? null : _takeStadiumPhoto,
+                                    icon: const Icon(Icons.camera_alt),
+                                    label: const Text('Caméra'),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.green.shade50,
+                                      foregroundColor: Colors.green.shade700,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 16),
+
                             Row(
                               children: [
                                 Expanded(
@@ -1561,6 +2454,15 @@ class _HomePageState extends State<HomePage> {
   List<ReservationRequest> _userReservations = [];
   List<ReservationRequest> _managerRequests = [];
   bool _isLoading = true;
+  Stream<List<ReservationRequest>>? _reservationsStream;
+
+  // Cache pour optimiser les performances
+  static final SimpleCache<List<Map<String, dynamic>>> _stadesCache =
+      SimpleCache<List<Map<String, dynamic>>>(defaultTtl: const Duration(minutes: 10));
+  static final SimpleCache<List<Map<String, String>>> _slotsCache =
+      SimpleCache<List<Map<String, String>>>(defaultTtl: const Duration(minutes: 2));
+  static final SimpleCache<List<ReservationRequest>> _reservationsCache =
+      SimpleCache<List<ReservationRequest>>(defaultTtl: const Duration(minutes: 1));
 
   @override
   void initState() {
@@ -1608,11 +2510,37 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _isLoading = false;
       });
-      debugPrint('Error loading user data: $e');
+      AppLogger.error('Erreur critique lors du chargement des données utilisateur', e);
+      // Afficher message d'erreur à l'utilisateur
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('Erreur de chargement des données. Veuillez redémarrer l\'application.'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 5),
+            action: SnackBarAction(
+              label: 'Réessayer',
+              textColor: Colors.white,
+              onPressed: _loadUserData,
+            ),
+          ),
+        );
+      }
     }
   }
 
   Future<void> _loadStades() async {
+    // Vérifier le cache d'abord
+    final cacheKey = 'stades_$_currentUserType';
+    final cachedStades = _stadesCache.get(cacheKey);
+    if (cachedStades != null) {
+      setState(() {
+        _stades = cachedStades;
+      });
+      AppLogger.debug('Stades chargés depuis le cache (${cachedStades.length})');
+      return;
+    }
+
     try {
       final prefs = await SharedPreferences.getInstance();
       
@@ -1707,9 +2635,100 @@ class _HomePageState extends State<HomePage> {
           }
         }
       }
+
+      // Mettre en cache les stades chargés
+      _stadesCache.set(cacheKey, List.from(_stades));
+      AppLogger.info('${_stades.length} stades chargés et mis en cache');
+
     } catch (e) {
-      debugPrint('Error loading stadiums: $e');
+      AppLogger.error('Erreur chargement stades', e);
     }
+  }
+
+  /// Crée un stream en temps réel des réservations depuis Firestore
+  Stream<List<ReservationRequest>> _getUserReservationsStream() {
+    final firebaseUser = FirebaseAuth.instance.currentUser;
+    if (firebaseUser == null) {
+      return Stream.value([]);
+    }
+    
+    final firestore = FirebaseFirestore.instance;
+    return firestore
+        .collection('reservations')
+        .where('userId', isEqualTo: firebaseUser.uid)
+        .snapshots()
+        .map((snapshot) {
+      final reservations = <ReservationRequest>[];
+      
+      for (final doc in snapshot.docs) {
+        try {
+          final data = doc.data();
+          final request = ReservationRequest(
+            id: doc.id,
+            stadeId: data['stadeId'] ?? '',
+            stadeNom: data['stadeNom'] ?? '',
+            clientNom: data['clientNom'] ?? '',
+            clientEmail: data['clientEmail'] ?? '',
+            dateReservation: DateTime.tryParse(data['dateReservation'] ?? '') ?? DateTime.now(),
+            heureDebut: data['heureDebut'] ?? '',
+            heureFin: data['heureFin'] ?? '',
+            raison: data['raison'] ?? '',
+            statut: data['statut'] ?? 'En attente',
+            dateCreation: (data['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
+          );
+          reservations.add(request);
+        } catch (e) {
+          print('❌ Erreur parsing réservation ${doc.id}: $e');
+        }
+      }
+      
+      // Trier par date de création (plus récentes en premier)
+      reservations.sort((a, b) => b.dateCreation.compareTo(a.dateCreation));
+      
+      print('🔄 Stream: ${reservations.length} réservations synchronisées');
+      return reservations;
+    });
+  }
+
+  Stream<List<ReservationRequest>> _getAllReservationsStreamForAdmin() {
+    final firebaseUser = FirebaseAuth.instance.currentUser;
+    if (firebaseUser == null) {
+      return Stream.value([]);
+    }
+    
+    final firestore = FirebaseFirestore.instance;
+    return firestore
+        .collection('reservations')
+        .orderBy('createdAt', descending: true)
+        .snapshots()
+        .map((snapshot) {
+      final reservations = <ReservationRequest>[];
+      
+      for (final doc in snapshot.docs) {
+        try {
+          final data = doc.data();
+          final request = ReservationRequest(
+            id: doc.id,
+            stadeId: data['stadeId'] ?? '',
+            stadeNom: data['stadeNom'] ?? '',
+            clientNom: data['clientNom'] ?? '',
+            clientEmail: data['clientEmail'] ?? '',
+            dateReservation: DateTime.tryParse(data['dateReservation'] ?? '') ?? DateTime.now(),
+            heureDebut: data['heureDebut'] ?? '',
+            heureFin: data['heureFin'] ?? '',
+            raison: data['raison'] ?? '',
+            statut: data['statut'] ?? 'En attente',
+            dateCreation: (data['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
+          );
+          reservations.add(request);
+        } catch (e) {
+          print('❌ Erreur parsing réservation admin ${doc.id}: $e');
+        }
+      }
+      
+      print('🔄 Stream Admin: ${reservations.length} réservations synchronisées');
+      return reservations;
+    });
   }
 
   Future<void> _loadUserReservations() async {
@@ -1725,7 +2744,6 @@ class _HomePageState extends State<HomePage> {
         final querySnapshot = await firestore
             .collection('reservations')
             .where('userId', isEqualTo: firebaseUser.uid)
-            .orderBy('createdAt', descending: true)
             .get();
             
         for (final doc in querySnapshot.docs) {
@@ -1746,8 +2764,13 @@ class _HomePageState extends State<HomePage> {
           _userReservations.add(request);
         }
         
-        print('📋 Réservations chargées depuis Firestore: ${_userReservations.length}');
-        if (mounted) setState(() {});
+        // Trier localement par date de création (plus récentes en premier)
+        _userReservations.sort((a, b) => b.dateCreation.compareTo(a.dateCreation));
+        
+        AppLogger.info('Réservations chargées depuis Firestore: ${_userReservations.length}');
+        if (mounted) {
+          setState(() {});
+        }
         return;
       }
       
@@ -1778,7 +2801,7 @@ class _HomePageState extends State<HomePage> {
             }
           }
         } catch (e) {
-          debugPrint('Error parsing reservation $id: $e');
+          AppLogger.warning('Réservation $id ignorée - format invalide: $e');
           // Skip this reservation and continue with others
           continue;
         }
@@ -1786,67 +2809,111 @@ class _HomePageState extends State<HomePage> {
       
       // Sort by date creation (most recent first)
       _userReservations.sort((a, b) => b.dateCreation.compareTo(a.dateCreation));
+      AppLogger.info('${_userReservations.length} réservations utilisateur chargées');
     } catch (e) {
-      debugPrint('Error loading user reservations: $e');
+      AppLogger.error('Erreur critique chargement réservations utilisateur', e);
+      // Afficher un indicateur d'erreur dans l'UI
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Impossible de charger vos réservations'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      }
     }
   }
 
   /// Vérifie les créneaux indisponibles pour un stade à une date donnée
   Future<List<Map<String, String>>> _getUnavailableSlots(String stadeId, DateTime date) async {
-    List<Map<String, String>> unavailableSlots = [];
-    
+    final dateStr = DateFormat('dd/MM/yyyy').format(date);
+    final cacheKey = 'slots_${stadeId}_$dateStr';
+
+    // Vérifier le cache d'abord
+    final cachedSlots = _slotsCache.get(cacheKey);
+    if (cachedSlots != null) {
+      AppLogger.debug('Créneaux chargés depuis le cache: ${cachedSlots.length}');
+      return cachedSlots;
+    }
+
+    final Set<String> uniqueSlots = <String>{}; // Éviter les doublons
+    final List<Map<String, String>> unavailableSlots = [];
+
     try {
-      // Vérifier dans Firestore pour les utilisateurs Firebase
-      final firestore = FirebaseFirestore.instance;
-      final dateStr = DateFormat('dd/MM/yyyy').format(date);
-      
-      final querySnapshot = await firestore
-          .collection('reservations')
-          .where('stadeId', isEqualTo: stadeId)
-          .where('dateReservation', isEqualTo: dateStr)
-          .where('statut', whereIn: ['En attente', 'Confirmée', 'en_attente', 'confirmee'])
-          .get();
-          
-      for (final doc in querySnapshot.docs) {
-        final data = doc.data();
-        unavailableSlots.add({
-          'debut': data['heureDebut'] ?? '',
-          'fin': data['heureFin'] ?? '',
-          'client': data['clientNom'] ?? 'Client',
-        });
-      }
-      
-      // Vérifier aussi dans SharedPreferences pour compatibilité
-      final prefs = await SharedPreferences.getInstance();
-      final requestIds = prefs.getStringList('reservation_requests') ?? [];
-      
-      for (final id in requestIds) {
-        final requestData = prefs.getString('request_$id');
-        if (requestData != null) {
-          final parts = requestData.split('|');
-          if (parts.length >= 9) {
-            final reservationDate = parts[3];
-            final reservationStade = parts[0];
-            final statut = parts[7];
-            
-            if (reservationStade == stadeId && 
-                reservationDate == dateStr && 
-                (statut == 'En attente' || statut == 'Confirmée')) {
-              unavailableSlots.add({
-                'debut': parts[4],
-                'fin': parts[5],
-                'client': parts[1],
-              });
+      final firebaseUser = FirebaseAuth.instance.currentUser;
+
+      // Priorité à Firestore si utilisateur connecté
+      if (firebaseUser != null) {
+        final firestore = FirebaseFirestore.instance;
+
+        final querySnapshot = await firestore
+            .collection('reservations')
+            .where('stadeId', isEqualTo: stadeId)
+            .where('dateReservation', isEqualTo: dateStr)
+            .where('statut', whereIn: ['En attente', 'Confirmée', 'en_attente', 'confirmee'])
+            .get();
+
+        for (final doc in querySnapshot.docs) {
+          final data = doc.data();
+          final debut = data['heureDebut'] ?? '';
+          final fin = data['heureFin'] ?? '';
+          final slotKey = '$debut-$fin';
+
+          if (debut.isNotEmpty && fin.isNotEmpty && !uniqueSlots.contains(slotKey)) {
+            uniqueSlots.add(slotKey);
+            unavailableSlots.add({
+              'debut': debut,
+              'fin': fin,
+              'client': data['clientNom'] ?? 'Client',
+            });
+          }
+        }
+
+        AppLogger.debug('Créneaux Firestore trouvés: ${unavailableSlots.length}');
+      } else {
+        // Fallback SharedPreferences uniquement si pas connecté Firebase
+        final prefs = await SharedPreferences.getInstance();
+        final requestIds = prefs.getStringList('reservation_requests') ?? [];
+
+        for (final id in requestIds) {
+          final requestData = prefs.getString('request_$id');
+          if (requestData != null) {
+            final parts = requestData.split('|');
+            if (parts.length >= 9) {
+              final reservationDate = parts[3];
+              final reservationStade = parts[0];
+              final statut = parts[7];
+              final debut = parts[4];
+              final fin = parts[5];
+              final slotKey = '$debut-$fin';
+
+              if (reservationStade == stadeId &&
+                  reservationDate == dateStr &&
+                  (statut == 'En attente' || statut == 'Confirmée') &&
+                  debut.isNotEmpty && fin.isNotEmpty &&
+                  !uniqueSlots.contains(slotKey)) {
+                uniqueSlots.add(slotKey);
+                unavailableSlots.add({
+                  'debut': debut,
+                  'fin': fin,
+                  'client': parts[1],
+                });
+              }
             }
           }
         }
+
+        AppLogger.debug('Créneaux SharedPreferences trouvés: ${unavailableSlots.length}');
       }
-      
-      print('🚫 Créneaux indisponibles pour $stadeId le $dateStr: ${unavailableSlots.length}');
+
+      // Mettre en cache les créneaux
+      _slotsCache.set(cacheKey, List.from(unavailableSlots));
+      AppLogger.info('Créneaux indisponibles pour $stadeId le $dateStr: ${unavailableSlots.length} (mis en cache)');
+
     } catch (e) {
-      print('❌ Erreur lors de la vérification des créneaux: $e');
+      AppLogger.error('Erreur lors de la vérification des créneaux', e);
     }
-    
+
     return unavailableSlots;
   }
 
@@ -1878,6 +2945,96 @@ class _HomePageState extends State<HomePage> {
     final hours = int.tryParse(parts[0]) ?? 0;
     final minutes = int.tryParse(parts[1]) ?? 0;
     return hours * 60 + minutes;
+  }
+
+  /// Supprime une réservation côté client
+  Future<void> _deleteReservation(ReservationRequest reservation) async {
+    try {
+      final firebaseUser = FirebaseAuth.instance.currentUser;
+      
+      if (firebaseUser != null && reservation.id.isNotEmpty) {
+        // Supprimer de Firestore
+        final firestore = FirebaseFirestore.instance;
+        await firestore.collection('reservations').doc(reservation.id).delete();
+        print('🗑️ Réservation supprimée de Firestore: ${reservation.id}');
+      }
+      
+      // Supprimer de SharedPreferences (pour compatibilité)
+      final prefs = await SharedPreferences.getInstance();
+      final requestIds = prefs.getStringList('reservation_requests') ?? [];
+      final updatedIds = requestIds.where((id) => id != reservation.id).toList();
+      await prefs.setStringList('reservation_requests', updatedIds);
+      await prefs.remove('request_${reservation.id}');
+      
+      // Le StreamBuilder se mettra automatiquement à jour
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Réservation supprimée avec succès'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+      
+      print('🗑️ Réservation supprimée avec succès: ${reservation.stadeNom}');
+    } catch (e) {
+      print('❌ Erreur suppression réservation: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Erreur lors de la suppression: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  /// Affiche un dialogue de confirmation pour supprimer une réservation
+  void _showDeleteConfirmationDialog(ReservationRequest reservation) {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Confirmer la suppression'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Êtes-vous sûr de vouloir supprimer cette réservation ?'),
+              const SizedBox(height: 8),
+              Text(
+                'Stade: ${reservation.stadeNom}',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+              Text(
+                'Date: ${DateFormat('dd/MM/yyyy').format(reservation.dateReservation)}',
+              ),
+              Text(
+                'Horaire: ${reservation.heureDebut} - ${reservation.heureFin}',
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Annuler'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _deleteReservation(reservation);
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.red,
+                foregroundColor: Colors.white,
+              ),
+              child: const Text('Supprimer'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   Future<void> _loadManagerRequests() async {
@@ -1920,7 +3077,7 @@ class _HomePageState extends State<HomePage> {
               }
             }
           } catch (e) {
-            debugPrint('Error parsing manager request $id: $e');
+            AppLogger.warning('Demande gestionnaire $id ignorée - format invalide: $e');
             // Skip this request and continue with others
             continue;
           }
@@ -1929,8 +3086,17 @@ class _HomePageState extends State<HomePage> {
       
       // Sort by date creation (most recent first)
       _managerRequests.sort((a, b) => b.dateCreation.compareTo(a.dateCreation));
+      AppLogger.info('${_managerRequests.length} demandes gestionnaire chargées');
     } catch (e) {
-      debugPrint('Error loading manager requests: $e');
+      AppLogger.error('Erreur critique chargement demandes gestionnaire', e);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Impossible de charger les demandes de réservation'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      }
     }
   }
 
@@ -2277,13 +3443,17 @@ class _HomePageState extends State<HomePage> {
                   ),
                   ElevatedButton.icon(
                     onPressed: () async {
-                      setState(() {
-                        _isLoading = true;
-                      });
+                      if (mounted) {
+                        setState(() {
+                          _isLoading = true;
+                        });
+                      }
                       await _loadUserReservations();
-                      setState(() {
-                        _isLoading = false;
-                      });
+                      if (mounted) {
+                        setState(() {
+                          _isLoading = false;
+                        });
+                      }
                     },
                     icon: const Icon(Icons.refresh, size: 16),
                     label: const Text('Actualiser'),
@@ -2304,8 +3474,50 @@ class _HomePageState extends State<HomePage> {
           ),
         ),
         Expanded(
-          child: _userReservations.isEmpty
-              ? Center(
+          child: StreamBuilder<List<ReservationRequest>>(
+            stream: _getUserReservationsStream(),
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const Center(
+                  child: CircularProgressIndicator(),
+                );
+              }
+              
+              if (snapshot.hasError) {
+                return Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.error_outline,
+                        size: 64,
+                        color: Colors.red[400],
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        'Erreur de connexion',
+                        style: TextStyle(
+                          fontSize: 18,
+                          color: Colors.red[600],
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Impossible de charger les réservations',
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: Colors.grey[600],
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }
+              
+              final reservations = snapshot.data ?? [];
+              
+              if (reservations.isEmpty) {
+                return Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
@@ -2324,7 +3536,7 @@ class _HomePageState extends State<HomePage> {
                       ),
                       const SizedBox(height: 8),
                       const Text(
-                        'Vos demandes de réservation apparaîtront ici',
+                        'Vos demandes de réservation apparaîtront ici automatiquement',
                         style: TextStyle(
                           fontSize: 14,
                           color: Colors.grey,
@@ -2332,14 +3544,18 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ],
                   ),
-                )
-              : ListView.builder(
-                  padding: const EdgeInsets.symmetric(horizontal: 16.0),
-                  itemCount: _userReservations.length,
-                  itemBuilder: (context, index) {
-                    return _buildReservationCard(_userReservations[index]);
-                  },
-                ),
+                );
+              }
+              
+              return ListView.builder(
+                padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                itemCount: reservations.length,
+                itemBuilder: (context, index) {
+                  return _buildReservationCard(reservations[index]);
+                },
+              );
+            },
+          ),
         ),
       ],
     );
@@ -2377,8 +3593,50 @@ class _HomePageState extends State<HomePage> {
           ),
         ),
         Expanded(
-          child: _managerRequests.isEmpty
-              ? Center(
+          child: StreamBuilder<List<ReservationRequest>>(
+            stream: _getAllReservationsStreamForAdmin(),
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const Center(
+                  child: CircularProgressIndicator(),
+                );
+              }
+              
+              if (snapshot.hasError) {
+                return Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.error_outline,
+                        size: 64,
+                        color: Colors.red[400],
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        'Erreur de connexion',
+                        style: TextStyle(
+                          fontSize: 18,
+                          color: Colors.red[600],
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Impossible de charger les réservations',
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: Colors.grey[600],
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }
+              
+              final reservations = snapshot.data ?? [];
+              
+              if (reservations.isEmpty) {
+                return Center(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
@@ -2397,7 +3655,7 @@ class _HomePageState extends State<HomePage> {
                       ),
                       const SizedBox(height: 8),
                       const Text(
-                        'Les demandes pour votre stade apparaîtront ici',
+                        'Les nouvelles demandes apparaîtront automatiquement ici',
                         style: TextStyle(
                           fontSize: 14,
                           color: Colors.grey,
@@ -2405,17 +3663,59 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ],
                   ),
-                )
-              : ListView.builder(
-                  padding: const EdgeInsets.symmetric(horizontal: 16.0),
-                  itemCount: _managerRequests.length,
-                  itemBuilder: (context, index) {
-                    return _buildManagerRequestCard(_managerRequests[index]);
-                  },
-                ),
+                );
+              }
+              
+              return ListView.builder(
+                padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                itemCount: reservations.length,
+                itemBuilder: (context, index) {
+                  return _buildManagerRequestCard(reservations[index]);
+                },
+              );
+            },
+          ),
         ),
       ],
     );
+  }
+
+  /// Calcule la durée en heures entre deux heures au format HH:mm
+  int _calculateReservationDuration(String heureDebut, String heureFin) {
+    try {
+      final debut = TimeOfDay(
+        hour: int.parse(heureDebut.split(':')[0]),
+        minute: int.parse(heureDebut.split(':')[1]),
+      );
+      final fin = TimeOfDay(
+        hour: int.parse(heureFin.split(':')[0]),
+        minute: int.parse(heureFin.split(':')[1]),
+      );
+
+      final debutMinutes = debut.hour * 60 + debut.minute;
+      final finMinutes = fin.hour * 60 + fin.minute;
+
+      final diffMinutes = finMinutes - debutMinutes;
+      return (diffMinutes / 60).round();
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  /// Calcule le temps écoulé depuis une date donnée en format lisible
+  String _getTimeAgo(DateTime date) {
+    final now = DateTime.now();
+    final difference = now.difference(date);
+
+    if (difference.inDays > 0) {
+      return '${difference.inDays} jour${difference.inDays > 1 ? 's' : ''}';
+    } else if (difference.inHours > 0) {
+      return '${difference.inHours} heure${difference.inHours > 1 ? 's' : ''}';
+    } else if (difference.inMinutes > 0) {
+      return '${difference.inMinutes} minute${difference.inMinutes > 1 ? 's' : ''}';
+    } else {
+      return 'quelques secondes';
+    }
   }
 
   Widget _buildReservationCard(ReservationRequest request) {
@@ -2498,47 +3798,363 @@ class _HomePageState extends State<HomePage> {
               ],
             ),
             const SizedBox(height: 12),
-            Row(
-              children: [
-                Icon(
-                  Icons.calendar_today,
-                  size: 16,
-                  color: Colors.grey[600],
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  DateFormat('dd/MM/yyyy').format(request.dateReservation),
-                  style: TextStyle(color: Colors.grey[600]),
-                ),
-                const SizedBox(width: 16),
-                Icon(
-                  Icons.access_time,
-                  size: 16,
-                  color: Colors.grey[600],
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  '${request.heureDebut} - ${request.heureFin}',
-                  style: TextStyle(color: Colors.grey[600]),
-                ),
-              ],
+            // Détails de la réservation plus visibles
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.grey[50],
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.grey[200]!),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Titre de la section
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    decoration: BoxDecoration(
+                      color: Colors.blue[50],
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: Colors.blue[200]!),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(
+                          Icons.sports_soccer,
+                          size: 16,
+                          color: Colors.blue[700],
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'DÉTAILS DE LA RÉSERVATION SOUHAITÉE',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.blue[700],
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // Jour souhaité (plus proéminent)
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [Colors.blue[100]!, Colors.blue[50]!],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.blue[300]!),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(
+                              Icons.calendar_today,
+                              size: 20,
+                              color: Colors.blue[700],
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              'Jour souhaité:',
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600,
+                                color: Colors.blue[700],
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        Text(
+                          DateFormat('EEEE dd MMMM yyyy', 'fr_FR').format(request.dateReservation),
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.blue[800],
+                            letterSpacing: 0.3,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+
+                  // Horaires souhaités (plus proéminent)
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [Colors.orange[100]!, Colors.orange[50]!],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.orange[300]!),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(
+                              Icons.access_time,
+                              size: 20,
+                              color: Colors.orange[700],
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              'Horaires souhaités:',
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w600,
+                                color: Colors.orange[700],
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                              decoration: BoxDecoration(
+                                color: Colors.orange[200],
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.play_arrow,
+                                    size: 16,
+                                    color: Colors.orange[800],
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    request.heureDebut,
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.orange[800],
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Icon(
+                              Icons.arrow_forward,
+                              size: 20,
+                              color: Colors.orange[600],
+                            ),
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                              decoration: BoxDecoration(
+                                color: Colors.orange[200],
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.stop,
+                                    size: 16,
+                                    color: Colors.orange[800],
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    request.heureFin,
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.orange[800],
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Durée: ${_calculateReservationDuration(request.heureDebut, request.heureFin)} heure(s)',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontStyle: FontStyle.italic,
+                            color: Colors.orange[600],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
             ),
             if (request.raison.isNotEmpty) ...[
               const SizedBox(height: 8),
-              Text(
-                'Raison: ${request.raison}',
-                style: TextStyle(
-                  color: Colors.grey[700],
-                  fontStyle: FontStyle.italic,
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.blue[50],
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: Colors.blue[200]!),
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.info_outline,
+                      size: 16,
+                      color: Colors.blue[600],
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Raison: ${request.raison}',
+                        style: TextStyle(
+                          color: Colors.blue[700],
+                          fontWeight: FontWeight.w500,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ],
-            const SizedBox(height: 8),
-            Text(
-              'Demandé le ${DateFormat('dd/MM/yyyy à HH:mm').format(request.dateCreation)}',
-              style: TextStyle(
-                color: Colors.grey[500],
-                fontSize: 12,
+            const SizedBox(height: 12),
+
+            // Section Date/Heure de création de la demande (plus visible)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Colors.grey[100],
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.grey[300]!),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Icon(
+                        Icons.schedule_send,
+                        size: 16,
+                        color: Colors.grey[600],
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        'DEMANDE CRÉÉE LE:',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.grey[600],
+                          letterSpacing: 0.5,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      // Date de création
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: Colors.grey[200],
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.calendar_month,
+                              size: 14,
+                              color: Colors.grey[700],
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              DateFormat('dd/MM/yyyy').format(request.dateCreation),
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.grey[800],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      // Heure de création
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: Colors.grey[200],
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.access_time,
+                              size: 14,
+                              color: Colors.grey[700],
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              DateFormat('HH:mm:ss').format(request.dateCreation),
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.grey[800],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  // Temps écoulé depuis la création
+                  Text(
+                    'il y a ${_getTimeAgo(request.dateCreation)}',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontStyle: FontStyle.italic,
+                      color: Colors.grey[600],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            // Bouton de suppression
+            Align(
+              alignment: Alignment.centerRight,
+              child: ElevatedButton.icon(
+                onPressed: () => _showDeleteConfirmationDialog(request),
+                icon: const Icon(Icons.delete, size: 16),
+                label: const Text('Supprimer'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.red.shade100,
+                  foregroundColor: Colors.red.shade700,
+                  elevation: 0,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                ),
               ),
             ),
           ],
@@ -2726,7 +4342,9 @@ class _HomePageState extends State<HomePage> {
           
           // Refresh the manager requests
           await _loadManagerRequests();
-          setState(() {});
+          if (mounted) {
+            setState(() {});
+          }
           
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -2970,9 +4588,19 @@ class _ReservationDialogState extends State<ReservationDialog> {
       
       _nomController.text = userName;
       _emailController.text = currentUser; // current_user stores the email
-      setState(() {});
+      if (mounted) {
+        setState(() {});
+      }
     } catch (e) {
-      debugPrint('Error loading user info: $e');
+      AppLogger.error('Erreur chargement info utilisateur pour réservation', e);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Impossible de charger vos informations utilisateur'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      }
     }
   }
 
@@ -2983,7 +4611,7 @@ class _ReservationDialogState extends State<ReservationDialog> {
       firstDate: DateTime.now(),
       lastDate: DateTime.now().add(const Duration(days: 365)),
     );
-    if (picked != null) {
+    if (picked != null && mounted) {
       setState(() {
         _dateReservation = picked;
       });
@@ -3030,10 +4658,11 @@ class _ReservationDialogState extends State<ReservationDialog> {
           return;
         }
         
-        if (_emailController.text.trim().isEmpty || !_emailController.text.contains('@')) {
+        final emailValidation = FormValidators.validateEmail(_emailController.text.trim());
+        if (emailValidation != null) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Un email valide est requis'),
+            SnackBar(
+              content: Text(emailValidation),
               backgroundColor: Colors.red,
             ),
           );
@@ -3050,45 +4679,6 @@ class _ReservationDialogState extends State<ReservationDialog> {
           return;
         }
         
-        // Vérifier les conflits de créneaux horaires
-        final homeState = context.findAncestorStateOfType<_HomePageState>();
-        if (homeState != null) {
-          final unavailableSlots = await homeState._getUnavailableSlots(widget.stade['nom'], _dateReservation);
-          final hasConflict = homeState._isTimeSlotConflict(_heureDebut, _heureFin, unavailableSlots);
-          
-          if (hasConflict) {
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text(
-                    'Ce créneau ($_heureDebut - $_heureFin) est déjà réservé pour cette date. '
-                    'Veuillez choisir un autre horaire.',
-                  ),
-                  backgroundColor: Colors.red,
-                  duration: const Duration(seconds: 5),
-                ),
-              );
-            }
-            return;
-          }
-          
-          // Afficher les créneaux indisponibles
-          if (unavailableSlots.isNotEmpty && mounted) {
-            final slotsText = unavailableSlots.map((slot) => 
-              '${slot['debut']} - ${slot['fin']}').join(', ');
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  'Créneaux déjà réservés: $slotsText',
-                  style: const TextStyle(fontSize: 12),
-                ),
-                backgroundColor: Colors.orange,
-                duration: const Duration(seconds: 3),
-              ),
-            );
-          }
-        }
-        
         final request = ReservationRequest(
           id: DateTime.now().millisecondsSinceEpoch.toString(),
           stadeId: widget.stade['nom'],
@@ -3103,30 +4693,107 @@ class _ReservationDialogState extends State<ReservationDialog> {
           dateCreation: DateTime.now(),
         );
 
-        // Sauvegarder dans Firestore pour les utilisateurs Firebase
+        // Sauvegarder avec transaction Firebase pour éviter les race conditions
         if (firebaseUser != null) {
-          await FirebaseFirestore.instance.collection('reservations').add({
-            'userId': firebaseUser.uid,
-            'stadeId': request.stadeId,
-            'stadeNom': request.stadeNom,
-            'clientNom': request.clientNom,
-            'clientEmail': request.clientEmail,
-            'dateReservation': DateFormat('dd/MM/yyyy').format(request.dateReservation),
-            'heureDebut': request.heureDebut,
-            'heureFin': request.heureFin,
-            'raison': request.raison,
-            'statut': 'En attente',
-            'createdAt': FieldValue.serverTimestamp(),
+          final db = FirebaseFirestore.instance;
+          bool transactionSuccessful = false;
+          
+          // Utiliser query normale au lieu de transaction pour éviter les conflits
+          final dateKey = DateFormat('dd/MM/yyyy').format(_dateReservation);
+          final reservationsSnapshot = await db.collection('reservations')
+            .where('stadeId', isEqualTo: widget.stade['nom'])
+            .where('dateReservation', isEqualTo: dateKey)
+            .where('statut', whereIn: ['En attente', 'Confirmée'])
+            .get();
+
+          // Vérifier les conflits d'horaires
+          final unavailableSlots = <Map<String, String>>[];
+          for (final doc in reservationsSnapshot.docs) {
+            final data = doc.data();
+            unavailableSlots.add({
+              'debut': data['heureDebut'] ?? '',
+              'fin': data['heureFin'] ?? '',
+            });
+          }
+
+          await db.runTransaction((transaction) async {
+
+            // Fonction locale pour vérifier conflit de créneaux
+            bool checkTimeSlotConflict(String newStart, String newEnd, List<Map<String, String>> slots) {
+              final newStartTime = TimeOfDay(
+                hour: int.parse(newStart.split(':')[0]),
+                minute: int.parse(newStart.split(':')[1]),
+              );
+              final newEndTime = TimeOfDay(
+                hour: int.parse(newEnd.split(':')[0]),
+                minute: int.parse(newEnd.split(':')[1]),
+              );
+              final newStartMinutes = newStartTime.hour * 60 + newStartTime.minute;
+              final newEndMinutes = newEndTime.hour * 60 + newEndTime.minute;
+
+              for (final slot in slots) {
+                if (slot['debut']?.isNotEmpty == true && slot['fin']?.isNotEmpty == true) {
+                  final existingStart = TimeOfDay(
+                    hour: int.parse(slot['debut']!.split(':')[0]),
+                    minute: int.parse(slot['debut']!.split(':')[1]),
+                  );
+                  final existingEnd = TimeOfDay(
+                    hour: int.parse(slot['fin']!.split(':')[0]),
+                    minute: int.parse(slot['fin']!.split(':')[1]),
+                  );
+                  final existingStartMinutes = existingStart.hour * 60 + existingStart.minute;
+                  final existingEndMinutes = existingEnd.hour * 60 + existingEnd.minute;
+
+                  // Vérifier chevauchement
+                  if ((newStartMinutes < existingEndMinutes) && (newEndMinutes > existingStartMinutes)) {
+                    return true;
+                  }
+                }
+              }
+              return false;
+            }
+
+            final hasConflict = checkTimeSlotConflict(_heureDebut, _heureFin, unavailableSlots);
+            
+            if (hasConflict) {
+              throw FirebaseException(
+                plugin: 'firestore',
+                code: 'slot-conflict',
+                message: 'Ce créneau ($_heureDebut - $_heureFin) est déjà réservé pour cette date.',
+              );
+            }
+
+            // Pas de conflit - ajouter la réservation
+            final docRef = db.collection('reservations').doc();
+            transaction.set(docRef, {
+              'userId': firebaseUser.uid,
+              'stadeId': request.stadeId,
+              'stadeNom': request.stadeNom,
+              'clientNom': request.clientNom,
+              'clientEmail': request.clientEmail,
+              'dateReservation': dateKey,
+              'heureDebut': request.heureDebut,
+              'heureFin': request.heureFin,
+              'raison': request.raison,
+              'statut': 'En attente',
+              'createdAt': FieldValue.serverTimestamp(),
+            });
+            
+            transactionSuccessful = true;
           });
           
-          print('💾 Réservation sauvegardée dans Firestore');
-          
-          // Notifier le HomeScreen pour recharger les données
-          if (context.mounted) {
-            final homeState = context.findAncestorStateOfType<_HomePageState>();
-            if (homeState != null) {
-              await homeState._loadUserReservations();
-              homeState.setState(() {});
+          if (transactionSuccessful) {
+            AppLogger.success('Réservation sauvegardée avec succès (transaction atomique)');
+            
+            // Notifier le HomeScreen pour recharger les données
+            if (context.mounted) {
+              final homeState = context.findAncestorStateOfType<_HomePageState>();
+              if (homeState != null) {
+                await homeState._loadUserReservations();
+                if (homeState.mounted) {
+                  homeState.setState(() {});
+                }
+              }
             }
           }
         }
@@ -3158,11 +4825,28 @@ class _ReservationDialogState extends State<ReservationDialog> {
             ),
           );
         }
+      } on FirebaseException catch (e) {
+        if (mounted) {
+          String errorMessage;
+          if (e.code == 'slot-conflict') {
+            errorMessage = e.message ?? 'Ce créneau est déjà réservé pour cette date.';
+          } else {
+            errorMessage = 'Erreur Firebase: ${e.message}';
+          }
+          
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(errorMessage),
+              backgroundColor: Colors.red,
+              duration: const Duration(seconds: 5),
+            ),
+          );
+        }
       } catch (e) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('Erreur lors de l\'envoi de la demande: ${e.toString()}'),
+              content: Text('Erreur inattendue lors de l\'envoi de la demande: ${e.toString()}'),
               backgroundColor: Colors.red,
               duration: const Duration(seconds: 5),
             ),
@@ -3337,11 +5021,7 @@ class _ReservationDialogState extends State<ReservationDialog> {
                           prefixIcon: Icon(Icons.email),
                           border: OutlineInputBorder(),
                         ),
-                        validator: (value) {
-                          if (value?.isEmpty == true) return 'Email requis';
-                          if (!value!.contains('@')) return 'Email invalide';
-                          return null;
-                        },
+                        validator: FormValidators.validateEmail,
                       ),
                       const SizedBox(height: 16),
                       
@@ -3484,5 +5164,516 @@ class _ReservationDialogState extends State<ReservationDialog> {
     _emailController.dispose();
     _raisonController.dispose();
     super.dispose();
+  }
+}
+
+// === PAGE DE CONFIRMATION D'EMAIL ===
+
+class EmailConfirmationPage extends StatefulWidget {
+  final String email;
+  final String userType;
+  final Map<String, dynamic> userData;
+
+  const EmailConfirmationPage({
+    super.key,
+    required this.email,
+    required this.userType,
+    required this.userData,
+  });
+
+  @override
+  State<EmailConfirmationPage> createState() => _EmailConfirmationPageState();
+}
+
+class _EmailConfirmationPageState extends State<EmailConfirmationPage> {
+  final _otpController = TextEditingController();
+  bool _isVerifying = false;
+  bool _isResending = false;
+  int _countdown = 60;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _startCountdown();
+  }
+
+  @override
+  void dispose() {
+    _otpController.dispose();
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  void _startCountdown() {
+    _countdown = 60;
+    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (mounted) {
+        setState(() {
+          if (_countdown > 0) {
+            _countdown--;
+          } else {
+            timer.cancel();
+          }
+        });
+      }
+    });
+  }
+
+  Future<void> _resendOtp() async {
+    if (_isResending || _countdown > 0) return;
+
+    setState(() {
+      _isResending = true;
+    });
+
+    try {
+      // Renvoyer l'OTP
+      await NotificationService.instance.sendEmailOtp(widget.email);
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Code de vérification renvoyé par email'),
+          backgroundColor: Colors.green,
+        ),
+      );
+
+      _startCountdown();
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Erreur lors du renvoi: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } finally {
+      setState(() {
+        _isResending = false;
+      });
+    }
+  }
+
+  Future<void> _verifyOtpAndCreateAccount() async {
+    if (_otpController.text.trim().length != 6) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Veuillez saisir le code à 6 chiffres'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+
+    setState(() {
+      _isVerifying = true;
+    });
+
+    try {
+      // Vérifier l'OTP
+      final bool isValid = NotificationService.instance.verifyOtpCode(
+        widget.email,
+        _otpController.text.trim()
+      );
+
+      if (!isValid) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Code de vérification invalide'),
+            backgroundColor: Colors.red,
+          ),
+        );
+        return;
+      }
+
+      // OTP valide, créer le compte Firebase
+      UserCredential result = await FirebaseAuth.instance.createUserWithEmailAndPassword(
+        email: widget.email,
+        password: widget.userData['password'],
+      );
+
+      if (result.user != null) {
+        // Supprimer le mot de passe des données à sauvegarder
+        final Map<String, dynamic> dataToSave = Map<String, dynamic>.from(widget.userData);
+        dataToSave.remove('password');
+        dataToSave.remove('confirmPassword');
+
+        // Sauvegarder les données utilisateur dans Firestore
+        await FirebaseFirestore.instance
+            .collection('users')
+            .doc(result.user!.uid)
+            .set(dataToSave);
+
+        if (mounted) {
+          // Rediriger vers la page de succès
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(
+              builder: (context) => RegistrationSuccessPage(
+                email: widget.email,
+                userType: widget.userType,
+              ),
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      String errorMessage = 'Erreur lors de la création du compte';
+
+      if (e.toString().contains('email-already-in-use')) {
+        errorMessage = 'Cette adresse email est déjà utilisée';
+      } else if (e.toString().contains('weak-password')) {
+        errorMessage = 'Le mot de passe est trop faible';
+      } else if (e.toString().contains('invalid-email')) {
+        errorMessage = 'Adresse email invalide';
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(errorMessage),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } finally {
+      setState(() {
+        _isVerifying = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      appBar: AppBar(
+        title: const Text('Confirmation d\'email'),
+        backgroundColor: const Color(0xFF1E88E5),
+        foregroundColor: Colors.white,
+        elevation: 0,
+      ),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: Column(
+            children: [
+              Expanded(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    // Icône
+                    Container(
+                      width: 100,
+                      height: 100,
+                      decoration: BoxDecoration(
+                        color: Colors.blue.shade50,
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(
+                        Icons.email_outlined,
+                        size: 50,
+                        color: Colors.blue.shade600,
+                      ),
+                    ),
+                    const SizedBox(height: 32),
+
+                    // Titre
+                    const Text(
+                      'Vérifiez votre email',
+                      style: TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.black87,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 16),
+
+                    // Description
+                    Text(
+                      'Nous avons envoyé un code de vérification à:\n${widget.email}',
+                      style: const TextStyle(
+                        fontSize: 16,
+                        color: Colors.grey,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 32),
+
+                    // Champ OTP
+                    TextFormField(
+                      controller: _otpController,
+                      keyboardType: TextInputType.number,
+                      textAlign: TextAlign.center,
+                      maxLength: 6,
+                      style: const TextStyle(
+                        fontSize: 24,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 8,
+                      ),
+                      decoration: InputDecoration(
+                        hintText: '000000',
+                        hintStyle: TextStyle(color: Colors.grey.shade400),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide(color: Colors.grey.shade300),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: const BorderSide(color: Color(0xFF1E88E5), width: 2),
+                        ),
+                        counterText: '',
+                        contentPadding: const EdgeInsets.symmetric(vertical: 20),
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+
+                    // Bouton de vérification
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton(
+                        onPressed: _isVerifying ? null : _verifyOtpAndCreateAccount,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF1E88E5),
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 16),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                        child: _isVerifying
+                            ? const Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                    ),
+                                  ),
+                                  SizedBox(width: 12),
+                                  Text('Création du compte...'),
+                                ],
+                              )
+                            : const Text(
+                                'Vérifier et créer le compte',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+
+                    // Bouton renvoyer
+                    TextButton(
+                      onPressed: (_countdown == 0 && !_isResending) ? _resendOtp : null,
+                      child: _isResending
+                          ? const Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                ),
+                                SizedBox(width: 8),
+                                Text('Envoi en cours...'),
+                              ],
+                            )
+                          : Text(
+                              _countdown > 0
+                                  ? 'Renvoyer le code dans ${_countdown}s'
+                                  : 'Renvoyer le code',
+                              style: TextStyle(
+                                color: _countdown > 0 ? Colors.grey : Colors.blue,
+                                fontSize: 16,
+                              ),
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+
+              // Instructions
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.blue.shade50,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  children: [
+                    Icon(
+                      Icons.info_outline,
+                      color: Colors.blue.shade600,
+                      size: 20,
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      'Vérifiez votre dossier spam si vous ne recevez pas le code.',
+                      style: TextStyle(
+                        fontSize: 13,
+                        color: Colors.black87,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// === PAGE DE SUCCÈS D'INSCRIPTION ===
+
+class RegistrationSuccessPage extends StatelessWidget {
+  final String email;
+  final String userType;
+
+  const RegistrationSuccessPage({
+    super.key,
+    required this.email,
+    required this.userType,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.white,
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              // Animation de succès
+              Container(
+                width: 120,
+                height: 120,
+                decoration: BoxDecoration(
+                  color: Colors.green.shade50,
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  Icons.check_circle,
+                  size: 70,
+                  color: Colors.green.shade600,
+                ),
+              ),
+              const SizedBox(height: 32),
+
+              // Titre
+              const Text(
+                'Inscription réussie !',
+                style: TextStyle(
+                  fontSize: 28,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.black87,
+                ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 16),
+
+              // Message de succès
+              Text(
+                userType == 'gestionnaire'
+                    ? 'Félicitations ! Votre compte gestionnaire a été créé avec succès.\n\nVous pouvez maintenant gérer votre stade et traiter les demandes de réservation.'
+                    : 'Félicitations ! Votre compte a été créé avec succès.\n\nVous pouvez maintenant réserver des terrains de football.',
+                style: const TextStyle(
+                  fontSize: 16,
+                  color: Colors.grey,
+                  height: 1.5,
+                ),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 16),
+
+              // Email confirmé
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.blue.shade50,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.blue.shade200),
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.email,
+                      color: Colors.blue.shade600,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Email vérifié',
+                            style: TextStyle(
+                              fontWeight: FontWeight.w600,
+                              fontSize: 14,
+                            ),
+                          ),
+                          Text(
+                            email,
+                            style: TextStyle(
+                              color: Colors.grey.shade600,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Icon(
+                      Icons.verified,
+                      color: Colors.green.shade600,
+                      size: 20,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 48),
+
+              // Bouton continuer
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: () {
+                    // Retourner à la page de connexion
+                    Navigator.of(context).pushAndRemoveUntil(
+                      MaterialPageRoute(
+                        builder: (context) => const BookFootApp(),
+                      ),
+                      (route) => false,
+                    );
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF1E88E5),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  child: const Text(
+                    'Commencer à utiliser BookFoot237',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }

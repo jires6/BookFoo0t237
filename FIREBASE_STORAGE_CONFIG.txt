@@ -1,0 +1,128 @@
+📋 GUIDE CONFIGURATION FIREBASE STORAGE - BOOKFOOT237
+================================================================
+
+🎯 OBJECTIF: Permettre l'affichage des images des stades dans l'application
+
+📍 ÉTAPES À SUIVRE:
+
+1️⃣ ALLER DANS LA CONSOLE FIREBASE
+   - Ouvrir: https://console.firebase.google.com
+   - Sélectionner le projet "bookfoot237"
+   - Cliquer sur "Storage" dans le menu de gauche
+
+2️⃣ CONFIGURER LES RÈGLES DE SÉCURITÉ
+   - Aller dans l'onglet "Rules" (Règles)
+   - Remplacer TOUT le contenu par les règles ci-dessous:
+
+================================================================
+RÈGLES FIREBASE STORAGE À COPIER-COLLER:
+================================================================
+
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    // ✅ IMAGES DES STADES - Lecture publique pour affichage
+    match /stadiums/{stadiumId}/{imageId} {
+      // Tout le monde peut lire (voir les images)
+      allow read: if true;
+
+      // Seuls les utilisateurs connectés peuvent uploader
+      allow write: if request.auth != null
+                   && request.auth.token.email_verified == true;
+    }
+
+    // ✅ AUTRES FICHIERS - Accès restreint aux utilisateurs connectés
+    match /{allPaths=**} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null;
+    }
+  }
+}
+
+================================================================
+
+3️⃣ PUBLIER LES RÈGLES
+   - Cliquer sur "Publish" (Publier)
+   - Confirmer la publication
+
+4️⃣ VÉRIFIER LA CONFIGURATION
+   - Aller dans l'onglet "Files" (Fichiers)
+   - Vérifier que le dossier "stadiums/" existe
+   - Tester l'upload d'images depuis l'app
+
+================================================================
+🔧 CONFIGURATION CORS (SI NÉCESSAIRE)
+================================================================
+
+Si les images ne se chargent toujours pas après les règles:
+
+1. Installer Google Cloud SDK
+2. Créer le fichier cors.json:
+
+[
+  {
+    "origin": ["*"],
+    "method": ["GET", "HEAD"],
+    "maxAgeSeconds": 3600,
+    "responseHeader": ["Content-Type", "Access-Control-Allow-Origin"]
+  }
+]
+
+3. Appliquer CORS:
+gsutil cors set cors.json gs://VOTRE-PROJECT-ID.appspot.com
+
+================================================================
+📱 STRUCTURE DES IMAGES DANS STORAGE
+================================================================
+
+Le code Flutter sauvegarde les images dans cette structure:
+└── stadiums/
+    ├── temp_1726672345678/
+    │   ├── 1726672345678_image1.jpg
+    │   └── 1726672345678_image2.jpg
+    └── temp_1726672456789/
+        └── 1726672456789_image3.jpg
+
+================================================================
+🐛 DÉPANNAGE
+================================================================
+
+❌ PROBLÈME: Images ne s'affichent pas
+✅ SOLUTION:
+   1. Vérifier les règles Storage (étape 2)
+   2. Vérifier que les URLs commencent par "https://"
+   3. Tester avec une image simple
+
+❌ PROBLÈME: Upload échoue
+✅ SOLUTION:
+   1. Vérifier que l'utilisateur est connecté
+   2. Vérifier les permissions d'écriture
+   3. Vérifier la taille des images (max 10MB)
+
+❌ PROBLÈME: Erreur CORS
+✅ SOLUTION:
+   1. Appliquer la configuration CORS ci-dessus
+   2. Attendre 5-10 minutes pour propagation
+
+================================================================
+📞 SUPPORT
+================================================================
+
+Si problème persiste:
+1. Vérifier les logs Firebase (Console → Storage → Usage)
+2. Tester l'URL directement dans un navigateur
+3. Vérifier les logs de l'application Flutter
+
+================================================================
+✅ CHECKLIST FINALE
+================================================================
+
+□ Règles Storage appliquées et publiées
+□ Structure de dossiers "stadiums/" visible
+□ Test upload depuis l'application
+□ Test affichage des images
+□ URLs des images accessibles publiquement
+
+Une fois toutes ces étapes terminées, les images des stades
+devraient s'afficher correctement dans BookFoot237! ⚽
