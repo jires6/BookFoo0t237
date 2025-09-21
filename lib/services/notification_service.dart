@@ -244,4 +244,340 @@ class NotificationService {
       return null;
     }
   }
+
+  /// Envoie un email de statut de réservation (confirmation/rejet)
+  Future<bool> sendReservationStatusEmail({
+    required String clientEmail,
+    required String clientName,
+    required String stadeNom,
+    required String dateReservation,
+    required String heureDebut,
+    required String heureFin,
+    required String raison,
+    required bool isAccepted,
+  }) async {
+    try {
+      print('📧 Envoi email de statut réservation à $clientEmail');
+
+      // Utiliser la même configuration Gmail que pour les OTP
+      if (!NotificationConfig.isGmailConfigured) {
+        print('❌ Configuration Gmail manquante');
+        return false;
+      }
+
+      final smtpServer = SmtpServer(
+        'smtp.gmail.com',
+        port: 587,
+        username: NotificationConfig.gmailUsername,
+        password: NotificationConfig.gmailAppPassword,
+        allowInsecure: false,
+        ssl: false,
+        ignoreBadCertificate: false,
+      );
+
+      String subject;
+      String htmlContent;
+
+      if (isAccepted) {
+        subject = '✅ Votre réservation a été confirmée - BookFoot237';
+        htmlContent = '''
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <div style="background-color: #4CAF50; color: white; padding: 20px; text-align: center;">
+            <h1>🎉 Réservation Confirmée !</h1>
+          </div>
+
+          <div style="padding: 20px; background-color: #f5f5f5;">
+            <h2>Bonjour $clientName,</h2>
+
+            <p>Excellente nouvelle ! Votre demande de réservation a été <strong>acceptée</strong> par le gestionnaire.</p>
+
+            <div style="background-color: white; padding: 15px; border-radius: 8px; margin: 20px 0;">
+              <h3>📋 Détails de votre réservation :</h3>
+              <ul style="line-height: 1.6;">
+                <li><strong>Stade :</strong> $stadeNom</li>
+                <li><strong>Date :</strong> $dateReservation</li>
+                <li><strong>Horaire :</strong> $heureDebut - $heureFin</li>
+                <li><strong>Raison :</strong> $raison</li>
+              </ul>
+            </div>
+
+            <div style="background-color: #e8f5e8; padding: 15px; border-radius: 8px; border-left: 4px solid #4CAF50;">
+              <p><strong>⚠️ Important :</strong> Votre réservation est maintenant confirmée. Veuillez vous présenter à l'heure prévue.</p>
+            </div>
+
+            <p>Merci d'avoir choisi BookFoot237 pour vos réservations de stades !</p>
+
+            <div style="text-align: center; margin-top: 30px;">
+              <p style="color: #666;">L'équipe BookFoot237<br>
+              📧 contact@bookfoot237.cm | 📱 +237 6XX XXX XXX</p>
+            </div>
+          </div>
+        </div>
+        ''';
+      } else {
+        subject = '❌ Votre réservation a été refusée - BookFoot237';
+        htmlContent = '''
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <div style="background-color: #f44336; color: white; padding: 20px; text-align: center;">
+            <h1>😔 Réservation Non Confirmée</h1>
+          </div>
+
+          <div style="padding: 20px; background-color: #f5f5f5;">
+            <h2>Bonjour $clientName,</h2>
+
+            <p>Nous regrettons de vous informer que votre demande de réservation a été <strong>refusée</strong> par le gestionnaire.</p>
+
+            <div style="background-color: white; padding: 15px; border-radius: 8px; margin: 20px 0;">
+              <h3>📋 Détails de la demande :</h3>
+              <ul style="line-height: 1.6;">
+                <li><strong>Stade :</strong> $stadeNom</li>
+                <li><strong>Date :</strong> $dateReservation</li>
+                <li><strong>Horaire :</strong> $heureDebut - $heureFin</li>
+                <li><strong>Raison :</strong> $raison</li>
+              </ul>
+            </div>
+
+            <div style="background-color: #fff3cd; padding: 15px; border-radius: 8px; border-left: 4px solid #ffc107;">
+              <p><strong>💡 Suggestion :</strong> Le créneau pourrait être déjà réservé ou indisponible. N'hésitez pas à faire une nouvelle demande pour d'autres créneaux.</p>
+            </div>
+
+            <p>Merci de votre compréhension et à bientôt sur BookFoot237 !</p>
+
+            <div style="text-align: center; margin-top: 30px;">
+              <p style="color: #666;">L'équipe BookFoot237<br>
+              📧 contact@bookfoot237.cm | 📱 +237 6XX XXX XXX</p>
+            </div>
+          </div>
+        </div>
+        ''';
+      }
+
+      final message = Message()
+        ..from = Address(NotificationConfig.gmailUsername, 'BookFoot237')
+        ..recipients.add(clientEmail)
+        ..subject = subject
+        ..html = htmlContent;
+
+      final sendReport = await send(message, smtpServer);
+      print('✅ Email de statut envoyé avec succès: ${sendReport.toString()}');
+      return true;
+
+    } catch (e) {
+      print('❌ Erreur envoi email de statut: $e');
+      return false;
+    }
+  }
+
+  /// Envoie un email de notification au gestionnaire pour une nouvelle demande de réservation
+  Future<bool> sendNewReservationNotificationToManager({
+    required String managerEmail,
+    required String clientName,
+    required String clientEmail,
+    required String stadeNom,
+    required String dateReservation,
+    required String heureDebut,
+    required String heureFin,
+    required String raison,
+  }) async {
+    try {
+      print('📧 Envoi notification nouvelle demande au gestionnaire: $managerEmail');
+      print('📧 Depuis: ${NotificationConfig.gmailUsername}');
+      print('📧 Configuration Gmail active: ${NotificationConfig.isGmailConfigured}');
+
+      // Utiliser la même configuration Gmail
+      if (!NotificationConfig.isGmailConfigured) {
+        print('❌ Configuration Gmail manquante');
+        return false;
+      }
+
+      // Configuration SMTP robuste pour tous les domaines avec sécurité renforcée
+      final smtpServer = SmtpServer(
+        'smtp.gmail.com',
+        port: 587,
+        username: NotificationConfig.gmailUsername,
+        password: NotificationConfig.gmailAppPassword,
+        allowInsecure: false,
+        ssl: false,
+        ignoreBadCertificate: false,
+      );
+
+      final subject = '🔔 Nouvelle demande de réservation - $stadeNom - BookFoot237';
+      final htmlContent = '''
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <div style="background-color: #2196F3; color: white; padding: 20px; text-align: center;">
+          <h1>📋 Nouvelle Demande de Réservation</h1>
+        </div>
+
+        <div style="padding: 20px; background-color: #f5f5f5;">
+          <h2>Bonjour,</h2>
+
+          <p>Vous avez reçu une nouvelle demande de réservation pour votre stade <strong>$stadeNom</strong>.</p>
+
+          <div style="background-color: white; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #2196F3;">
+            <h3>👤 Informations du client :</h3>
+            <ul style="line-height: 1.6;">
+              <li><strong>Nom :</strong> $clientName</li>
+              <li><strong>Email :</strong> $clientEmail</li>
+            </ul>
+          </div>
+
+          <div style="background-color: white; padding: 15px; border-radius: 8px; margin: 20px 0;">
+            <h3>📋 Détails de la demande :</h3>
+            <ul style="line-height: 1.6;">
+              <li><strong>Stade :</strong> $stadeNom</li>
+              <li><strong>Date :</strong> $dateReservation</li>
+              <li><strong>Horaire :</strong> $heureDebut - $heureFin</li>
+              <li><strong>Raison :</strong> $raison</li>
+            </ul>
+          </div>
+
+          <div style="background-color: #e3f2fd; padding: 15px; border-radius: 8px; border-left: 4px solid #2196F3;">
+            <p><strong>⚡ Action requise :</strong> Connectez-vous à l'application BookFoot237 pour accepter ou refuser cette demande.</p>
+          </div>
+
+          <div style="text-align: center; margin: 30px 0;">
+            <div style="background-color: #2196F3; color: white; padding: 15px; border-radius: 8px; display: inline-block;">
+              <p style="margin: 0; font-weight: bold;">📱 Ouvrez l'app BookFoot237</p>
+              <p style="margin: 5px 0 0 0; font-size: 14px;">Section Gestionnaire → Demandes en attente</p>
+            </div>
+          </div>
+
+          <p>Le client attend votre réponse. Une notification lui sera automatiquement envoyée dès que vous prendrez une décision.</p>
+
+          <div style="text-align: center; margin-top: 30px;">
+            <p style="color: #666;">L'équipe BookFoot237<br>
+            📧 contact@bookfoot237.cm | 📱 +237 6XX XXX XXX</p>
+          </div>
+        </div>
+      </div>
+      ''';
+
+      // Validation et nettoyage de l'adresse email du destinataire
+      String cleanManagerEmail = managerEmail.trim().toLowerCase();
+      print('📧 Email destinataire nettoyé: $cleanManagerEmail');
+
+      final message = Message()
+        ..from = Address(NotificationConfig.gmailUsername, 'BookFoot237')
+        ..recipients.add(cleanManagerEmail)
+        ..subject = subject
+        ..html = htmlContent
+        // Ajouter des en-têtes pour améliorer la délivrabilité
+        ..headers = {
+          'X-Priority': '1',
+          'X-MSMail-Priority': 'High',
+          'Importance': 'high',
+          'Reply-To': NotificationConfig.gmailUsername,
+        };
+
+      print('📧 Tentative d\'envoi email vers: $cleanManagerEmail');
+      print('📧 Sujet: $subject');
+
+      final sendReport = await send(message, smtpServer);
+      print('✅ Email de notification gestionnaire envoyé avec succès: ${sendReport.toString()}');
+      print('✅ Rapport détaillé: ${sendReport.mail}');
+      return true;
+
+    } catch (e, stackTrace) {
+      print('❌ Erreur envoi email notification gestionnaire: $e');
+      print('❌ Stack trace: $stackTrace');
+
+      // Tenter de déterminer le type d'erreur
+      if (e.toString().contains('authentication') || e.toString().contains('username') || e.toString().contains('password')) {
+        print('❌ Erreur d\'authentification Gmail - Vérifiez les identifiants');
+      } else if (e.toString().contains('network') || e.toString().contains('connection')) {
+        print('❌ Erreur de connexion réseau');
+      } else if (e.toString().contains('smtp')) {
+        print('❌ Erreur SMTP serveur');
+      }
+
+      return false;
+    }
+  }
+
+  /// Envoie un email de notification au gestionnaire pour une annulation de réservation
+  Future<bool> sendCancellationNotificationToManager({
+    required String managerEmail,
+    required String clientName,
+    required String clientEmail,
+    required String stadeNom,
+    required String dateReservation,
+    required String heureDebut,
+    required String heureFin,
+    required String raison,
+  }) async {
+    try {
+      print('📧 Envoi email annulation gestionnaire à: $managerEmail');
+
+      final smtpServer = gmail(
+        NotificationConfig.gmailUsername,
+        NotificationConfig.gmailAppPassword,
+      );
+
+      final subject = '❌ Annulation de réservation - $stadeNom';
+
+      final htmlContent = '''
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <div style="background: linear-gradient(135deg, #ff7043 0%, #ff5722 100%); padding: 30px; text-align: center; border-radius: 10px 10px 0 0;">
+          <h1 style="color: white; margin: 0; font-size: 28px;">📋 BookFoot237</h1>
+          <p style="color: white; margin: 10px 0 0 0; font-size: 16px;">Annulation de réservation</p>
+        </div>
+
+        <div style="background-color: #f5f5f5; padding: 30px; border-radius: 0 0 10px 10px;">
+          <div style="background-color: #ffcdd2; padding: 15px; border-radius: 8px; border-left: 4px solid #f44336; margin-bottom: 20px;">
+            <h2 style="color: #d32f2f; margin: 0 0 10px 0;">❌ Réservation annulée</h2>
+            <p style="margin: 0; color: #666;">Un client a annulé sa réservation confirmée</p>
+          </div>
+
+          <div style="background-color: white; padding: 15px; border-radius: 8px; margin: 20px 0;">
+            <h3>👤 Informations client :</h3>
+            <ul style="line-height: 1.6;">
+              <li><strong>Nom :</strong> $clientName</li>
+              <li><strong>Email :</strong> $clientEmail</li>
+            </ul>
+          </div>
+
+          <div style="background-color: white; padding: 15px; border-radius: 8px; margin: 20px 0;">
+            <h3>📋 Détails de la réservation annulée :</h3>
+            <ul style="line-height: 1.6;">
+              <li><strong>Stade :</strong> $stadeNom</li>
+              <li><strong>Date :</strong> $dateReservation</li>
+              <li><strong>Horaire :</strong> $heureDebut - $heureFin</li>
+              <li><strong>Raison initiale :</strong> $raison</li>
+            </ul>
+          </div>
+
+          <div style="background-color: #fff3e0; padding: 15px; border-radius: 8px; border-left: 4px solid #ff9800;">
+            <p><strong>📅 Créneaux libéré :</strong> Le créneau horaire est maintenant disponible pour d'autres réservations.</p>
+          </div>
+
+          <div style="text-align: center; margin: 30px 0;">
+            <div style="background-color: #ff7043; color: white; padding: 15px; border-radius: 8px; display: inline-block;">
+              <p style="margin: 0; font-weight: bold;">📱 Gérez vos réservations</p>
+              <p style="margin: 5px 0 0 0; font-size: 14px;">Application BookFoot237 → Section Gestionnaire</p>
+            </div>
+          </div>
+
+          <div style="text-align: center; margin-top: 30px;">
+            <p style="color: #666;">L'équipe BookFoot237<br>
+            📧 contact@bookfoot237.cm | 📱 +237 6XX XXX XXX</p>
+          </div>
+        </div>
+      </div>
+      ''';
+
+      final message = Message()
+        ..from = Address(NotificationConfig.gmailUsername, 'BookFoot237')
+        ..recipients.add(managerEmail)
+        ..subject = subject
+        ..html = htmlContent;
+
+      final sendReport = await send(message, smtpServer);
+      print('✅ Email d\'annulation gestionnaire envoyé avec succès: ${sendReport.toString()}');
+      return true;
+
+    } catch (e) {
+      print('❌ Erreur envoi email annulation gestionnaire: $e');
+      return false;
+    }
+  }
 }

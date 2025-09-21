@@ -6,6 +6,8 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:mailer/mailer.dart';
+import 'package:mailer/smtp_server.dart';
 import 'services/notification_service.dart';
 import 'services/app_lifecycle_service.dart';
 
@@ -431,9 +433,24 @@ class _LoginPageState extends State<LoginPage> {
 
   Future<void> _handleVisitorMode() async {
     try {
+      print('🔓 DÉCONNEXION COMPLÈTE - Mode visiteur activé');
+
+      // ÉTAPE 1: Déconnexion Firebase complète
+      if (FirebaseAuth.instance.currentUser != null) {
+        await FirebaseAuth.instance.signOut();
+        print('🔥 Firebase Auth déconnecté');
+      }
+
+      // ÉTAPE 2: Nettoyage complet des SharedPreferences
       final prefs = await SharedPreferences.getInstance();
+      await prefs.clear(); // Nettoie TOUT
+      print('🧹 SharedPreferences nettoyées complètement');
+
+      // ÉTAPE 3: Configuration du mode visiteur pur
       await prefs.setString('current_user', 'Visiteur');
       await prefs.setString('current_user_type', 'visiteur');
+      print('👁️ Mode visiteur configuré - Aucune session utilisateur');
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -444,6 +461,7 @@ class _LoginPageState extends State<LoginPage> {
         context.go('/home');
       }
     } catch (e) {
+      print('❌ Erreur activation mode visiteur: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Erreur: $e'), backgroundColor: Colors.red),
@@ -1586,10 +1604,27 @@ class _HomePageState extends State<HomePage> {
         await prefs.setString('current_user_type', _currentUserType);
         await prefs.setString('username_$_currentUser', _currentUserName);
       } else {
-        // Fallback sur SharedPreferences
-        _currentUser = prefs.getString('current_user') ?? 'Visiteur';
-        _currentUserType = prefs.getString('current_user_type') ?? 'visiteur';
-        _currentUserName = prefs.getString('username_$_currentUser') ?? _currentUser;
+        // Pas de Firebase Auth - Vérifier les données locales
+        final storedUserType = prefs.getString('current_user_type') ?? 'visiteur';
+        final storedUser = prefs.getString('current_user') ?? 'Visiteur';
+
+        // Si utilisateur prétend être client/gestionnaire sans Firebase Auth, nettoyer
+        if (storedUserType == 'client' || storedUserType == 'gestionnaire') {
+          print('⚠️ Session corrompue détectée - Utilisateur ${storedUserType} sans Firebase Auth');
+          await prefs.remove('current_user');
+          await prefs.remove('current_user_type');
+          await prefs.setString('current_user_type', 'visiteur');
+
+          _currentUser = 'Visiteur';
+          _currentUserType = 'visiteur';
+          _currentUserName = 'Visiteur';
+        } else {
+          // Mode visiteur légitime - conserver
+          print('👁️ Mode visiteur légitime maintenu');
+          _currentUser = storedUser;
+          _currentUserType = storedUserType;
+          _currentUserName = prefs.getString('username_$storedUser') ?? storedUser;
+        }
       }
       
       print('🔄 Données utilisateur chargées - User: $_currentUser ($_currentUserType) - $_currentUserName');
@@ -1614,31 +1649,43 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _loadStades() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      
-      if (_currentUserType == 'gestionnaire') {
-        // Load only manager's stadium
-        final stadeData = prefs.getString('stade_$_currentUser');
-        if (stadeData != null) {
-          // Parse the stadium data (pipe-separated format)
-          final parts = stadeData.split('|');
-          if (parts.length >= 6) {
-            final Map<String, dynamic> managerStade = {
-              'nom': parts[0],
-              'adresse': parts[1], 
-              'prix': int.tryParse(parts[2]) ?? 0,
-              'capacite': parts[3],
-              'type': parts[4],
-              'gestionnaire': parts[5],
-              'disponible': true,
-              'quartier': parts[1], // Use address as quartier
-              'description': 'Stade géré par ${_currentUserName}',
-            };
-            _stades = [managerStade];
-          }
-        }
-      } else {
-        // Load all stadiums for clients and visitors
+      print('🏟️ Chargement des stades depuis Firestore...');
+
+      // Charger tous les stades depuis Firestore
+      final QuerySnapshot querySnapshot = await FirebaseFirestore.instance
+          .collection('stadiums')
+          .get();
+
+      print('📊 ${querySnapshot.docs.length} stades trouvés dans Firestore');
+
+      _stades.clear();
+
+      // Convertir les documents Firestore en liste de stades
+      for (final doc in querySnapshot.docs) {
+        final data = doc.data() as Map<String, dynamic>;
+        final stade = {
+          'id': doc.id,
+          'nom': data['nom'] ?? 'Stade sans nom',
+          'adresse': data['adresse'] ?? '',
+          'quartier': data['quartier'] ?? data['adresse']?.split(',')?.first ?? '',
+          'prix': data['prix'] ?? 0,
+          'type': data['type'] ?? 'Terrain standard',
+          'capacite': data['capacite'] ?? '11v11',
+          'disponible': data['disponible'] ?? true,
+          'description': data['description'] ?? '',
+          'gestionnaire': data['gestionnaire'] ?? '',
+          'images': data['images'] ?? [],
+          'dateCreation': data['dateCreation'],
+        };
+
+        // Pour tous les utilisateurs (clients ET gestionnaires), afficher tous les stades
+        _stades.add(stade);
+        print('✅ Stade ajouté: ${stade['nom']} (gestionnaire: ${data['gestionnaire']})');
+      }
+
+      // Si aucun stade n'est trouvé pour les clients, ajouter les stades par défaut
+      if (_stades.isEmpty && _currentUserType != 'gestionnaire') {
+        print('⚠️ Aucun stade dans Firestore, ajout des stades par défaut');
         _stades = [
           {
             'nom': 'Stade Ahmadou Ahidjo',
@@ -1649,6 +1696,7 @@ class _HomePageState extends State<HomePage> {
             'disponible': true,
             'description': 'Stade principal de Yaoundé avec éclairage nocturne',
             'gestionnaire': 'admin@bookfoot.cm',
+            'images': [],
           },
           {
             'nom': 'Terrain Municipal Tsinga',
@@ -1659,6 +1707,7 @@ class _HomePageState extends State<HomePage> {
             'disponible': true,
             'description': 'Terrain moderne avec surface synthétique',
             'gestionnaire': 'tsinga@bookfoot.cm',
+            'images': [],
           },
           {
             'nom': 'Complexe Sportif Bastos',
@@ -1667,8 +1716,9 @@ class _HomePageState extends State<HomePage> {
             'type': 'Terrain en herbe naturelle',
             'capacite': '11v11',
             'disponible': true,
-            'description': 'Complexe haut de gamme avec plusieurs terrains',
+            'description': 'Complexe haut de gamme avec vestiaires VIP',
             'gestionnaire': 'bastos@bookfoot.cm',
+            'images': [],
           },
           {
             'nom': 'Terrain de Quartier Melen',
@@ -1679,42 +1729,22 @@ class _HomePageState extends State<HomePage> {
             'disponible': true,
             'description': 'Terrain communautaire accessible',
             'gestionnaire': 'melen@bookfoot.cm',
+            'images': [],
           },
         ];
-        
-        // Also include registered manager stadiums
-        final keys = prefs.getKeys();
-        for (final key in keys) {
-          if (key.startsWith('stade_') && !key.contains(_currentUser)) {
-            final stadeData = prefs.getString(key);
-            if (stadeData != null) {
-              final parts = stadeData.split('|');
-              if (parts.length >= 6) {
-                final Map<String, dynamic> stade = {
-                  'nom': parts[0],
-                  'adresse': parts[1], 
-                  'prix': int.tryParse(parts[2]) ?? 0,
-                  'capacite': parts[3],
-                  'type': parts[4],
-                  'gestionnaire': parts[5],
-                  'disponible': true,
-                  'quartier': parts[1], // Use address as quartier
-                  'description': 'Stade privé disponible à la réservation',
-                };
-                _stades.add(stade);
-              }
-            }
-          }
-        }
       }
+
+      print('🎉 ${_stades.length} stades chargés au total');
     } catch (e) {
+      print('❌ Erreur lors du chargement des stades: $e');
       debugPrint('Error loading stadiums: $e');
     }
   }
 
   Future<void> _loadUserReservations() async {
     try {
-      print('🔄 Chargement des réservations...');
+      print('🔄 Chargement des réservations pour client...');
+      print('👤 Current User: $_currentUser ($_currentUserType)');
       _userReservations.clear();
       
       // Récupérer depuis Firestore si utilisateur Firebase connecté
@@ -1722,31 +1752,103 @@ class _HomePageState extends State<HomePage> {
       print('👤 Firebase User: ${firebaseUser?.email}');
       if (firebaseUser != null) {
         final firestore = FirebaseFirestore.instance;
-        final querySnapshot = await firestore
-            .collection('reservations')
-            .where('userId', isEqualTo: firebaseUser.uid)
-            .orderBy('createdAt', descending: true)
-            .get();
+
+        // Essayer d'abord avec orderBy dateCreation, puis fallback sans orderBy
+        QuerySnapshot querySnapshot;
+        try {
+          querySnapshot = await firestore
+              .collection('reservations')
+              .where('userId', isEqualTo: firebaseUser.uid)
+              .orderBy('dateCreation', descending: true)  // Tri côté serveur - plus récente en premier
+              .get();
+          print('✅ Requête Firestore avec orderBy dateCreation réussie');
+        } catch (e) {
+          print('⚠️ Erreur orderBy dateCreation: $e, essai sans orderBy');
+          // Fallback sans orderBy (tri côté client après)
+          querySnapshot = await firestore
+              .collection('reservations')
+              .where('userId', isEqualTo: firebaseUser.uid)
+              .get();
+        }
             
+        print('📋 Trouvé ${querySnapshot.docs.length} réservations dans Firestore');
         for (final doc in querySnapshot.docs) {
-          final data = doc.data();
+          final data = doc.data() as Map<String, dynamic>;
+          print('📄 Document ${doc.id}: $data');
+
+          // Handle both Timestamp and String formats for dateReservation
+          DateTime dateReservation;
+          final dateReservationData = data['dateReservation'];
+          if (dateReservationData is Timestamp) {
+            dateReservation = dateReservationData.toDate();
+          } else if (dateReservationData is String) {
+            try {
+              dateReservation = DateFormat('dd/MM/yyyy').parse(dateReservationData);
+            } catch (e) {
+              print('⚠️ Error parsing date string: $dateReservationData, using current date');
+              dateReservation = DateTime.now();
+            }
+          } else {
+            dateReservation = DateTime.now();
+          }
+
+          // Handle both Timestamp and String formats for dateCreation (with fallback to createdAt)
+          DateTime dateCreation;
+          final dateCreationData = data['dateCreation'] ?? data['createdAt'];
+          if (dateCreationData is Timestamp) {
+            dateCreation = dateCreationData.toDate();
+          } else if (dateCreationData is String) {
+            try {
+              dateCreation = DateFormat('dd/MM/yyyy HH:mm').parse(dateCreationData);
+            } catch (e) {
+              print('⚠️ Error parsing creation date: $dateCreationData, using current date');
+              dateCreation = DateTime.now();
+            }
+          } else {
+            dateCreation = DateTime.now();
+          }
+
           final request = ReservationRequest(
             id: doc.id,
             stadeId: data['stadeId'] ?? '',
             stadeNom: data['stadeNom'] ?? '',
             clientNom: data['clientNom'] ?? '',
             clientEmail: data['clientEmail'] ?? '',
-            dateReservation: DateTime.tryParse(data['dateReservation'] ?? '') ?? DateTime.now(),
+            dateReservation: dateReservation,
             heureDebut: data['heureDebut'] ?? '',
             heureFin: data['heureFin'] ?? '',
             raison: data['raison'] ?? '',
             statut: data['statut'] ?? 'En attente',
-            dateCreation: (data['createdAt'] as Timestamp?)?.toDate() ?? DateTime.now(),
+            dateCreation: dateCreation,
           );
           _userReservations.add(request);
+          print('✅ Réservation ajoutée: ${request.stadeNom} - ${request.statut}');
         }
         
         print('📋 Réservations chargées depuis Firestore: ${_userReservations.length}');
+
+        // Si orderBy a échoué, faire le tri côté client
+        final needsClientSort = querySnapshot.docs.length > 1 && _userReservations.length > 1;
+        if (needsClientSort) {
+          // Vérifier si les données sont déjà triées (première réservation plus récente que la dernière)
+          final isAlreadySorted = _userReservations.first.dateCreation.isAfter(_userReservations.last.dateCreation) ||
+                                _userReservations.first.dateCreation.isAtSameMomentAs(_userReservations.last.dateCreation);
+
+          if (!isAlreadySorted) {
+            print('🔄 Tri côté client nécessaire pour les réservations Firestore');
+            _userReservations.sort((a, b) => b.dateCreation.compareTo(a.dateCreation));
+            print('✅ Tri côté client terminé');
+          } else {
+            print('✅ Réservations Firestore déjà triées côté serveur');
+          }
+        }
+
+        // Affichage pour vérification de l'ordre
+        for (int i = 0; i < _userReservations.length; i++) {
+          final reservation = _userReservations[i];
+          print('📅 Ordre final [$i]: ${reservation.stadeNom} - ${reservation.dateCreation} (${reservation.statut})');
+        }
+
         if (mounted) setState(() {});
         return;
       }
@@ -1784,8 +1886,20 @@ class _HomePageState extends State<HomePage> {
         }
       }
       
-      // Sort by date creation (most recent first)
-      _userReservations.sort((a, b) => b.dateCreation.compareTo(a.dateCreation));
+      // Sort by creation date ONLY for SharedPreferences data (newest requests at top)
+      // Tri pour les données SharedPreferences - la plus récente en premier
+      if (_userReservations.isNotEmpty) {
+        print('🔄 Tri des réservations SharedPreferences par date de création - ${_userReservations.length} réservations');
+
+        _userReservations.sort((a, b) {
+          // Tri uniquement par date de création (plus récente en premier)
+          final comparison = b.dateCreation.compareTo(a.dateCreation);
+          print('🔀 Comparaison SharedPreferences: ${a.stadeNom}(${a.dateCreation}) vs ${b.stadeNom}(${b.dateCreation}) = $comparison');
+          return comparison;
+        });
+
+        print('✅ Tri SharedPreferences terminé - ${_userReservations.length} réservations triées');
+      }
     } catch (e) {
       debugPrint('Error loading user reservations: $e');
     }
@@ -1794,32 +1908,71 @@ class _HomePageState extends State<HomePage> {
   /// Vérifie les créneaux indisponibles pour un stade à une date donnée
   Future<List<Map<String, String>>> _getUnavailableSlots(String stadeId, DateTime date) async {
     List<Map<String, String>> unavailableSlots = [];
-    
+
     try {
-      // Vérifier dans Firestore pour les utilisateurs Firebase
       final firestore = FirebaseFirestore.instance;
       final dateStr = DateFormat('dd/MM/yyyy').format(date);
-      
+
+      // 1. Vérifier les RÉSERVATIONS confirmées/en attente
       final querySnapshot = await firestore
           .collection('reservations')
           .where('stadeId', isEqualTo: stadeId)
-          .where('dateReservation', isEqualTo: dateStr)
-          .where('statut', whereIn: ['En attente', 'Confirmée', 'en_attente', 'confirmee'])
           .get();
-          
+
       for (final doc in querySnapshot.docs) {
         final data = doc.data();
-        unavailableSlots.add({
-          'debut': data['heureDebut'] ?? '',
-          'fin': data['heureFin'] ?? '',
-          'client': data['clientNom'] ?? 'Client',
-        });
+        final docDate = data['dateReservation'];
+        final statut = data['statut'] ?? '';
+
+        String docDateStr = '';
+        if (docDate is Timestamp) {
+          docDateStr = DateFormat('dd/MM/yyyy').format(docDate.toDate());
+        } else if (docDate is String) {
+          docDateStr = docDate;
+        }
+
+        if (docDateStr == dateStr &&
+            ['En attente', 'Confirmée', 'en_attente', 'confirmee'].contains(statut)) {
+          unavailableSlots.add({
+            'debut': data['heureDebut'] ?? '',
+            'fin': data['heureFin'] ?? '',
+            'client': data['clientNom'] ?? 'Client',
+            'type': 'reservation',
+          });
+        }
       }
-      
-      // Vérifier aussi dans SharedPreferences pour compatibilité
+
+      // 2. Vérifier les CRÉNEAUX BLOQUÉS (collection unavailable_slots)
+      final blockedSlots = await firestore
+          .collection('unavailable_slots')
+          .where('stadeId', isEqualTo: stadeId)
+          .get();
+
+      for (final doc in blockedSlots.docs) {
+        final data = doc.data();
+        final docDate = data['date'];
+
+        String docDateStr = '';
+        if (docDate is Timestamp) {
+          docDateStr = DateFormat('dd/MM/yyyy').format(docDate.toDate());
+        } else if (docDate is String) {
+          docDateStr = docDate;
+        }
+
+        if (docDateStr == dateStr) {
+          unavailableSlots.add({
+            'debut': data['heureDebut'] ?? '',
+            'fin': data['heureFin'] ?? '',
+            'client': data['clientNom'] ?? data['raison'] ?? 'Bloqué',
+            'type': 'blocked',
+          });
+        }
+      }
+
+      // 3. Vérifier aussi dans SharedPreferences pour compatibilité
       final prefs = await SharedPreferences.getInstance();
       final requestIds = prefs.getStringList('reservation_requests') ?? [];
-      
+
       for (final id in requestIds) {
         final requestData = prefs.getString('request_$id');
         if (requestData != null) {
@@ -1828,25 +1981,28 @@ class _HomePageState extends State<HomePage> {
             final reservationDate = parts[3];
             final reservationStade = parts[0];
             final statut = parts[7];
-            
-            if (reservationStade == stadeId && 
-                reservationDate == dateStr && 
+
+            if (reservationStade == stadeId &&
+                reservationDate == dateStr &&
                 (statut == 'En attente' || statut == 'Confirmée')) {
               unavailableSlots.add({
                 'debut': parts[4],
                 'fin': parts[5],
                 'client': parts[1],
+                'type': 'reservation',
               });
             }
           }
         }
       }
-      
+
       print('🚫 Créneaux indisponibles pour $stadeId le $dateStr: ${unavailableSlots.length}');
+      print('   - Réservations: ${unavailableSlots.where((s) => s['type'] == 'reservation').length}');
+      print('   - Bloqués: ${unavailableSlots.where((s) => s['type'] == 'blocked').length}');
     } catch (e) {
       print('❌ Erreur lors de la vérification des créneaux: $e');
     }
-    
+
     return unavailableSlots;
   }
 
@@ -1882,55 +2038,64 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _loadManagerRequests() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final requestIds = prefs.getStringList('reservation_requests') ?? [];
+      print('🔍 Chargement des demandes de réservation pour le gestionnaire...');
       _managerRequests.clear();
-      
-      // Get manager's stadium name
-      final stadeData = prefs.getString('stade_$_currentUser');
-      String? managerStadeName;
-      if (stadeData != null) {
-        final parts = stadeData.split('|');
-        if (parts.isNotEmpty) {
-          managerStadeName = parts[0]; // First part is the stadium name
+
+      // Get all stadiums owned by current manager
+      final myStadiums = _stades.where((stade) =>
+        stade['gestionnaire'] == _currentUserName ||
+        stade['gestionnaire'] == _currentUser
+      ).toList();
+
+      if (myStadiums.isEmpty) {
+        print('⚠️ Aucun stade trouvé pour ce gestionnaire');
+        return;
+      }
+
+      // Get stadium IDs and names
+      final myStadiumIds = myStadiums.map((stade) => stade['id']).toList();
+      final myStadiumNames = myStadiums.map((stade) => stade['nom']).toList();
+
+      print('🏟️ Stades du gestionnaire: ${myStadiumNames.join(', ')}');
+
+      // Load reservation requests from Firestore filtered by stadium IDs
+      final QuerySnapshot querySnapshot = await FirebaseFirestore.instance
+          .collection('reservations')
+          .where('stadeId', whereIn: myStadiumIds)
+          .get();
+
+      print('📋 ${querySnapshot.docs.length} demandes trouvées pour les stades du gestionnaire');
+
+      for (final doc in querySnapshot.docs) {
+        try {
+          final data = doc.data() as Map<String, dynamic>;
+          final request = ReservationRequest(
+            id: doc.id,
+            stadeId: data['stadeId'] ?? '',
+            stadeNom: data['stadeNom'] ?? '',
+            clientNom: data['clientNom'] ?? '',
+            clientEmail: data['clientEmail'] ?? '',
+            dateReservation: (data['dateReservation'] as Timestamp).toDate(),
+            heureDebut: data['heureDebut'] ?? '',
+            heureFin: data['heureFin'] ?? '',
+            raison: data['raison'] ?? '',
+            statut: data['statut'] ?? 'en_attente',
+            dateCreation: data['dateCreation'] != null
+                ? (data['dateCreation'] as Timestamp).toDate()
+                : DateTime.now(),
+          );
+          _managerRequests.add(request);
+        } catch (e) {
+          debugPrint('Erreur parsing request ${doc.id}: $e');
         }
       }
-      
-      if (managerStadeName != null) {
-        for (final id in requestIds) {
-          try {
-            final requestData = prefs.getString('request_$id');
-            if (requestData != null) {
-              final parts = requestData.split('|');
-              if (parts.length >= 9 && parts[0] == managerStadeName) {
-                final request = ReservationRequest(
-                  id: id,
-                  stadeId: parts[0],
-                  stadeNom: parts[0],
-                  clientNom: parts[1],
-                  clientEmail: parts[2],
-                  dateReservation: DateFormat('dd/MM/yyyy').parse(parts[3]),
-                  heureDebut: parts[4],
-                  heureFin: parts[5],
-                  raison: parts[6],
-                  statut: parts[7],
-                  dateCreation: DateFormat('dd/MM/yyyy HH:mm').parse(parts[8]),
-                );
-                _managerRequests.add(request);
-              }
-            }
-          } catch (e) {
-            debugPrint('Error parsing manager request $id: $e');
-            // Skip this request and continue with others
-            continue;
-          }
-        }
-      }
-      
-      // Sort by date creation (most recent first)
+
+      // Sort by creation date (most recent first)
       _managerRequests.sort((a, b) => b.dateCreation.compareTo(a.dateCreation));
+
+      print('✅ ${_managerRequests.length} demandes chargées avec succès');
     } catch (e) {
-      debugPrint('Error loading manager requests: $e');
+      debugPrint('Erreur loading manager requests: $e');
     }
   }
 
@@ -2020,11 +2185,22 @@ class _HomePageState extends State<HomePage> {
           if (_currentUserType == 'gestionnaire') ...[
             ListTile(
               leading: const Icon(Icons.stadium),
-              title: const Text('Mon Stade'),
+              title: const Text('Tous les Stades'),
               selected: _selectedTab == 'stades',
               onTap: () {
                 setState(() {
                   _selectedTab = 'stades';
+                });
+                Navigator.pop(context);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.sports_soccer),
+              title: const Text('Mes Stades'),
+              selected: _selectedTab == 'mes_stades',
+              onTap: () {
+                setState(() {
+                  _selectedTab = 'mes_stades';
                 });
                 Navigator.pop(context);
               },
@@ -2097,6 +2273,8 @@ class _HomePageState extends State<HomePage> {
     switch (_selectedTab) {
       case 'stades':
         return _buildStadesView();
+      case 'mes_stades':
+        return _buildMesStadesView();
       case 'historique':
         return _buildHistoriqueView();
       case 'demandes':
@@ -2241,6 +2419,107 @@ class _HomePageState extends State<HomePage> {
                         return _buildStadeCard(context, _stades[index]);
                       },
                     );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildMesStadesView() {
+    // Filter stadiums to show only those owned by current manager
+    final myStadiums = _stades.where((stade) =>
+      stade['gestionnaire'] == _currentUserName ||
+      stade['gestionnaire'] == _currentUser
+    ).toList();
+
+    return Column(
+      children: [
+        // Header with add button
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(16),
+          margin: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Colors.green.shade50,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.green.shade200),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'Mes Stades',
+                      style: TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.green,
+                      ),
+                    ),
+                  ),
+                  ElevatedButton.icon(
+                    onPressed: () {
+                      _showAddStadiumDialog();
+                    },
+                    icon: const Icon(Icons.add, size: 16),
+                    label: const Text('Ajouter'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.green,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Gérez vos stades: ajoutez, modifiez ou supprimez.',
+                style: TextStyle(color: Colors.grey[700]),
+              ),
+            ],
+          ),
+        ),
+
+        // My stadiums list
+        Expanded(
+          child: myStadiums.isEmpty
+              ? Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.sports_soccer,
+                        size: 64,
+                        color: Colors.grey[400],
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        'Aucun stade créé',
+                        style: TextStyle(
+                          fontSize: 18,
+                          color: Colors.grey[600],
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Cliquez sur "Ajouter" pour créer votre premier stade',
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: Colors.grey[500],
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
+                  ),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                  itemCount: myStadiums.length,
+                  itemBuilder: (context, index) {
+                    return _buildMyStadeCard(context, myStadiums[index]);
                   },
                 ),
         ),
@@ -2422,7 +2701,7 @@ class _HomePageState extends State<HomePage> {
     Color statusColor;
     String statusText;
     IconData statusIcon;
-    
+
     switch (request.statut) {
       case 'en_attente':
         statusColor = Colors.orange;
@@ -2434,6 +2713,11 @@ class _HomePageState extends State<HomePage> {
         statusText = 'Acceptée';
         statusIcon = Icons.check_circle;
         break;
+      case 'paye':
+        statusColor = Colors.blue;
+        statusText = 'Payée';
+        statusIcon = Icons.payment;
+        break;
       case 'refuse':
         statusColor = Colors.red;
         statusText = 'Refusée';
@@ -2444,7 +2728,7 @@ class _HomePageState extends State<HomePage> {
         statusText = 'Inconnu';
         statusIcon = Icons.help;
     }
-    
+
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
       child: Padding(
@@ -2541,6 +2825,97 @@ class _HomePageState extends State<HomePage> {
                 fontSize: 12,
               ),
             ),
+            // Boutons d'actions selon le statut de la réservation
+            const SizedBox(height: 12),
+
+            // Pour les réservations acceptées - Bouton de paiement
+            if (request.statut == 'accepte') ...[
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: () => _showPaymentMethodDialog(request),
+                  icon: const Icon(Icons.payment, size: 18),
+                  label: const Text(
+                    'Procéder au paiement',
+                    style: TextStyle(fontSize: 14),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.green,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              // Bouton d'annulation secondaire pour les réservations acceptées
+              SizedBox(
+                width: double.infinity,
+                child: TextButton.icon(
+                  onPressed: () => _showDeleteReservationDialog(request),
+                  icon: const Icon(Icons.cancel, size: 16),
+                  label: const Text(
+                    'Annuler la réservation',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                  style: TextButton.styleFrom(
+                    foregroundColor: Colors.orange,
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                  ),
+                ),
+              ),
+            ]
+            // Pour les réservations payées - Message de confirmation
+            else if (request.statut == 'paye') ...[
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.blue[50],
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.blue[200]!),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.check_circle, color: Colors.blue[700], size: 20),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        'Paiement confirmé - Réservation finalisée',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ]
+            // Pour les autres statuts - Boutons de suppression/annulation
+            else if (request.statut == 'en_attente' || request.statut == 'refuse') ...[
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: () => _showDeleteReservationDialog(request),
+                  icon: Icon(
+                    request.statut == 'en_attente' ? Icons.delete : Icons.delete_forever,
+                    size: 18,
+                  ),
+                  label: Text(
+                    request.statut == 'en_attente' ? 'Supprimer la demande' : 'Supprimer définitivement',
+                    style: const TextStyle(fontSize: 14),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: request.statut == 'en_attente' ? Colors.red : Colors.red[800],
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),
@@ -2551,7 +2926,7 @@ class _HomePageState extends State<HomePage> {
     Color statusColor;
     String statusText;
     IconData statusIcon;
-    
+
     switch (request.statut) {
       case 'en_attente':
         statusColor = Colors.orange;
@@ -2562,6 +2937,11 @@ class _HomePageState extends State<HomePage> {
         statusColor = Colors.green;
         statusText = 'Acceptée';
         statusIcon = Icons.check_circle;
+        break;
+      case 'paye':
+        statusColor = Colors.blue;
+        statusText = 'Payée';
+        statusIcon = Icons.payment;
         break;
       case 'refuse':
         statusColor = Colors.red;
@@ -2713,44 +3093,1792 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _handleRequestAction(String requestId, String newStatus) async {
     try {
+      print('🔄 Traitement de la demande $requestId avec statut: $newStatus');
+
+      // Trouver la réservation dans la liste actuelle pour récupérer les informations
+      final request = _managerRequests.firstWhere(
+        (req) => req.id == requestId,
+        orElse: () => throw Exception('Réservation non trouvée'),
+      );
+
+      // 1. Mettre à jour dans Firestore
+      final firestore = FirebaseFirestore.instance;
+      await firestore.collection('reservations').doc(requestId).update({
+        'statut': newStatus,
+        'dateTraitement': FieldValue.serverTimestamp(),
+        'gestionnaireTraitement': _currentUser,
+      });
+
+      print('✅ Statut mis à jour dans Firestore');
+
+      // 2. Envoyer l'email au client
+      await _sendReservationStatusEmail(request, newStatus);
+
+      // 2.5. Si la demande est acceptée, créer automatiquement un créneau indisponible
+      if (newStatus == 'accepte') {
+        print('🚫 Création automatique du créneau indisponible après validation');
+        await _createUnavailableSlot(request, raison: 'Réservation validée par le gestionnaire - Créneau réservé');
+      }
+
+      // 3. Fallback : Mettre à jour SharedPreferences pour compatibilité
       final prefs = await SharedPreferences.getInstance();
       final requestData = prefs.getString('request_$requestId');
-      
       if (requestData != null) {
         final parts = requestData.split('|');
         if (parts.length >= 9) {
-          // Update the status part
           parts[7] = newStatus;
           final updatedData = parts.join('|');
           await prefs.setString('request_$requestId', updatedData);
-          
-          // Refresh the manager requests
-          await _loadManagerRequests();
-          setState(() {});
-          
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                newStatus == 'accepte' 
-                    ? 'Demande acceptée avec succès' 
-                    : 'Demande refusée',
-              ),
-              backgroundColor: newStatus == 'accepte' ? Colors.green : Colors.orange,
-            ),
-          );
         }
       }
-    } catch (e) {
+
+      // 4. Actualiser l'affichage
+      await _loadManagerRequests();
+      setState(() {});
+
+      // 5. Afficher message de succès
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Erreur: $e'),
+          content: Text(
+            newStatus == 'accepte'
+                ? 'Demande acceptée avec succès. Email envoyé au client.'
+                : 'Demande refusée. Email envoyé au client.',
+          ),
+          backgroundColor: newStatus == 'accepte' ? Colors.green : Colors.orange,
+          duration: const Duration(seconds: 4),
+        ),
+      );
+
+      print('🎉 Action terminée avec succès');
+
+    } catch (e) {
+      print('❌ Erreur lors du traitement: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Erreur lors du traitement: $e'),
           backgroundColor: Colors.red,
+          duration: const Duration(seconds: 5),
         ),
       );
     }
   }
 
+  /// Envoie un email au client pour l'informer du statut de sa réservation
+  Future<void> _sendReservationStatusEmail(ReservationRequest request, String newStatus) async {
+    try {
+      print('📧 Préparation envoi email pour ${request.clientEmail}');
+
+      // Utiliser le NotificationService pour l'envoi réel d'emails
+      final bool emailSent = await NotificationService.instance.sendReservationStatusEmail(
+        clientEmail: request.clientEmail,
+        clientName: request.clientNom,
+        stadeNom: request.stadeNom,
+        dateReservation: DateFormat('dd/MM/yyyy').format(request.dateReservation),
+        heureDebut: request.heureDebut,
+        heureFin: request.heureFin,
+        raison: request.raison,
+        isAccepted: newStatus == 'accepte',
+      );
+
+      if (emailSent) {
+        print('✅ Email de statut envoyé avec succès à ${request.clientEmail}');
+      } else {
+        print('⚠️ Échec envoi email, mais traitement de la réservation continue');
+      }
+
+    } catch (e) {
+      print('❌ Erreur envoi email: $e');
+      // Ne pas faire échouer l'opération si l'email ne peut pas être envoyé
+      // On log juste l'erreur pour debugging
+    }
+  }
+
+  /// Envoie un email de notification au gestionnaire pour une nouvelle demande de réservation
+  Future<void> _sendManagerNotificationEmail(ReservationRequest request) async {
+    try {
+      print('📧 Recherche de l\'email du gestionnaire pour le stade: ${request.stadeNom}');
+
+      // Chercher le stade dans Firestore pour récupérer l'email du gestionnaire
+      final stadiumQuery = await FirebaseFirestore.instance
+          .collection('stadiums')
+          .where('nom', isEqualTo: request.stadeNom)
+          .limit(1)
+          .get();
+
+      if (stadiumQuery.docs.isEmpty) {
+        print('⚠️ Stade non trouvé dans Firestore: ${request.stadeNom}');
+        return;
+      }
+
+      final stadiumData = stadiumQuery.docs.first.data();
+      final managerEmail = stadiumData['managerEmail'] as String?;
+
+      if (managerEmail == null || managerEmail.isEmpty) {
+        print('⚠️ Email du gestionnaire non trouvé pour le stade: ${request.stadeNom}');
+        return;
+      }
+
+      print('📧 Envoi notification au gestionnaire: $managerEmail');
+
+      // Utiliser le NotificationService pour l'envoi réel d'emails
+      final bool emailSent = await NotificationService.instance.sendNewReservationNotificationToManager(
+        managerEmail: managerEmail,
+        clientName: request.clientNom,
+        clientEmail: request.clientEmail,
+        stadeNom: request.stadeNom,
+        dateReservation: DateFormat('dd/MM/yyyy').format(request.dateReservation),
+        heureDebut: request.heureDebut,
+        heureFin: request.heureFin,
+        raison: request.raison,
+      );
+
+      if (emailSent) {
+        print('✅ Email de notification envoyé avec succès au gestionnaire: $managerEmail');
+      } else {
+        print('⚠️ Échec envoi email au gestionnaire, mais création de la réservation continue');
+      }
+
+    } catch (e) {
+      print('❌ Erreur envoi email au gestionnaire: $e');
+      // Ne pas faire échouer l'opération si l'email ne peut pas être envoyé
+      // On log juste l'erreur pour debugging
+    }
+  }
+
+  /// Affiche une boîte de dialogue de confirmation pour supprimer/annuler une réservation
+  Future<void> _showDeleteReservationDialog(ReservationRequest request) async {
+    // Les clients peuvent supprimer toutes leurs réservations (en_attente, accepte, refuse)
+
+    final isWaitingStatus = request.statut == 'en_attente';
+    final isRefusedStatus = request.statut == 'refuse';
+    final actionText = isWaitingStatus ? 'supprimer cette demande' :
+                      isRefusedStatus ? 'supprimer définitivement cette réservation refusée' :
+                      'annuler cette réservation';
+    final titleText = isWaitingStatus ? 'Supprimer la demande' :
+                     isRefusedStatus ? 'Supprimer définitivement' :
+                     'Annuler la réservation';
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(titleText),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Voulez-vous vraiment $actionText ?'),
+            const SizedBox(height: 12),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.grey[100],
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    request.stadeNom,
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 4),
+                  Text('Date: ${DateFormat('dd/MM/yyyy').format(request.dateReservation)}'),
+                  Text('Heure: ${request.heureDebut} - ${request.heureFin}'),
+                ],
+              ),
+            ),
+            if (!isWaitingStatus) ...[
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.orange[50],
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.orange[200]!),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.info, color: Colors.orange[700], size: 16),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        'Le gestionnaire sera notifié de l\'annulation',
+                        style: TextStyle(
+                          color: Colors.orange[700],
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Annuler'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: isWaitingStatus ? Colors.red :
+                              isRefusedStatus ? Colors.red[800] : Colors.orange,
+              foregroundColor: Colors.white,
+            ),
+            child: Text(isWaitingStatus ? 'Supprimer' :
+                       isRefusedStatus ? 'Supprimer' : 'Annuler'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      await _deleteReservation(request);
+    }
+  }
+
+  /// Supprime ou annule une réservation
+  Future<void> _deleteReservation(ReservationRequest request) async {
+    try {
+      // Les clients peuvent supprimer toutes leurs réservations (en_attente, accepte, refuse)
+
+      final isWaitingStatus = request.statut == 'en_attente';
+      final isRefusedStatus = request.statut == 'refuse';
+
+      print('🗑️ ${isWaitingStatus ? "Suppression" : isRefusedStatus ? "Suppression définitive" : "Annulation"} de la réservation: ${request.stadeNom}');
+
+      // 1. Supprimer de Firestore
+      final firestore = FirebaseFirestore.instance;
+
+      // Chercher le document par son contenu (car nous n'avons pas l'ID directement)
+      final query = await firestore
+          .collection('reservations')
+          .where('clientEmail', isEqualTo: request.clientEmail)
+          .where('stadeNom', isEqualTo: request.stadeNom)
+          .where('dateReservation', isEqualTo: Timestamp.fromDate(request.dateReservation))
+          .where('heureDebut', isEqualTo: request.heureDebut)
+          .limit(1)
+          .get();
+
+      if (query.docs.isNotEmpty) {
+        final docId = query.docs.first.id;
+        await firestore.collection('reservations').doc(docId).delete();
+        print('✅ Réservation supprimée de Firestore');
+      } else {
+        print('⚠️ Réservation non trouvée dans Firestore');
+      }
+
+      // 2. Si c'est une annulation d'une réservation acceptée, envoyer un email au gestionnaire
+      if (request.statut == 'accepte') {
+        await _sendCancellationNotificationToManager(request);
+      }
+
+      // 3. Supprimer de la liste locale et rafraîchir l'interface
+      _userReservations.removeWhere((r) =>
+        r.clientEmail == request.clientEmail &&
+        r.stadeNom == request.stadeNom &&
+        r.dateReservation.isAtSameMomentAs(request.dateReservation) &&
+        r.heureDebut == request.heureDebut);
+
+      if (mounted) {
+        setState(() {});
+
+        // Afficher un message de succès
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              isWaitingStatus
+                ? 'Demande supprimée avec succès'
+                : 'Réservation annulée avec succès',
+            ),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+
+    } catch (e) {
+      print('❌ Erreur lors de la suppression: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Erreur lors de la suppression'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  /// Envoie un email au gestionnaire pour l'informer de l'annulation
+  Future<void> _sendCancellationNotificationToManager(ReservationRequest request) async {
+    try {
+      print('📧 Envoi notification d\'annulation au gestionnaire pour: ${request.stadeNom} (ID: ${request.stadeId})');
+
+      // D'abord essayer de chercher par stadeId (plus fiable)
+      QuerySnapshot? stadiumQuery;
+      if (request.stadeId != null && request.stadeId!.isNotEmpty) {
+        print('🔍 Recherche par stadeId: ${request.stadeId}');
+        stadiumQuery = await FirebaseFirestore.instance
+            .collection('stadiums')
+            .where(FieldPath.documentId, isEqualTo: request.stadeId)
+            .limit(1)
+            .get();
+      }
+
+      // Si pas trouvé par ID, chercher par nom
+      if (stadiumQuery == null || stadiumQuery.docs.isEmpty) {
+        print('🔍 Recherche par nom du stade: ${request.stadeNom}');
+        stadiumQuery = await FirebaseFirestore.instance
+            .collection('stadiums')
+            .where('nom', isEqualTo: request.stadeNom)
+            .limit(1)
+            .get();
+      }
+
+      if (stadiumQuery == null || stadiumQuery.docs.isEmpty) {
+        print('⚠️ Stade non trouvé pour notification d\'annulation: ${request.stadeNom} (ID: ${request.stadeId})');
+        return;
+      }
+
+      final stadiumData = stadiumQuery.docs.first.data() as Map<String, dynamic>;
+      final managerEmail = stadiumData['managerEmail'] as String?;
+
+      if (managerEmail == null || managerEmail.isEmpty) {
+        print('⚠️ Email du gestionnaire non trouvé pour notification d\'annulation');
+        return;
+      }
+
+      print('📧 Envoi notification d\'annulation au gestionnaire: $managerEmail');
+
+      // Utiliser le NotificationService pour l'envoi d'email d'annulation
+      // Note: Nous devons ajouter cette méthode au NotificationService
+      final bool emailSent = await NotificationService.instance.sendCancellationNotificationToManager(
+        managerEmail: managerEmail,
+        clientName: request.clientNom,
+        clientEmail: request.clientEmail,
+        stadeNom: request.stadeNom,
+        dateReservation: DateFormat('dd/MM/yyyy').format(request.dateReservation),
+        heureDebut: request.heureDebut,
+        heureFin: request.heureFin,
+        raison: request.raison,
+      );
+
+      if (emailSent) {
+        print('✅ Email d\'annulation envoyé avec succès au gestionnaire: $managerEmail');
+      } else {
+        print('⚠️ Échec envoi email d\'annulation au gestionnaire');
+      }
+
+    } catch (e) {
+      print('❌ Erreur envoi email d\'annulation au gestionnaire: $e');
+    }
+  }
+
+  /// Affiche le dialogue de sélection du mode de paiement
+  Future<void> _showPaymentMethodDialog(ReservationRequest request) async {
+    String? selectedPaymentMethod;
+    String? selectedMobileProvider;
+
+    final result = await showDialog<Map<String, String?>>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return StatefulBuilder(
+          builder: (context, setState) {
+            return AlertDialog(
+              title: Row(
+                children: [
+                  const Icon(Icons.payment, color: Colors.green),
+                  const SizedBox(width: 8),
+                  const Text('Mode de paiement'),
+                ],
+              ),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Informations de la réservation
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.blue[50],
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.blue[200]!),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Réservation: ${request.stadeNom}',
+                            style: const TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                          const SizedBox(height: 4),
+                          Text('Date: ${DateFormat('dd/MM/yyyy').format(request.dateReservation)}'),
+                          Text('Heure: ${request.heureDebut} - ${request.heureFin}'),
+                          Text('Montant: ${_calculateReservationTotal(request)} FCFA',
+                            style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.green)),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+
+                    // Sélection du mode de paiement
+                    const Text(
+                      'Choisissez votre mode de paiement :',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 12),
+
+                    // Option Espèces
+                    Container(
+                      decoration: BoxDecoration(
+                        border: Border.all(
+                          color: selectedPaymentMethod == 'especes' ? Colors.green : Colors.grey[300]!,
+                          width: selectedPaymentMethod == 'especes' ? 2 : 1,
+                        ),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: RadioListTile<String>(
+                        title: Row(
+                          children: [
+                            Icon(Icons.money, color: Colors.green[700]),
+                            const SizedBox(width: 8),
+                            const Text('Paiement en espèces'),
+                          ],
+                        ),
+                        subtitle: const Text('Payez directement au gestionnaire'),
+                        value: 'especes',
+                        groupValue: selectedPaymentMethod,
+                        onChanged: (value) {
+                          setState(() {
+                            selectedPaymentMethod = value;
+                            selectedMobileProvider = null; // Reset mobile provider
+                          });
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+
+                    // Option Mobile Money
+                    Container(
+                      decoration: BoxDecoration(
+                        border: Border.all(
+                          color: selectedPaymentMethod == 'mobile' ? Colors.green : Colors.grey[300]!,
+                          width: selectedPaymentMethod == 'mobile' ? 2 : 1,
+                        ),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: RadioListTile<String>(
+                        title: Row(
+                          children: [
+                            Icon(Icons.phone_android, color: Colors.blue[700]),
+                            const SizedBox(width: 8),
+                            const Text('Paiement mobile'),
+                          ],
+                        ),
+                        subtitle: const Text('MTN Money ou Orange Money'),
+                        value: 'mobile',
+                        groupValue: selectedPaymentMethod,
+                        onChanged: (value) {
+                          setState(() {
+                            selectedPaymentMethod = value;
+                          });
+                        },
+                      ),
+                    ),
+
+                    // Sélection du fournisseur mobile si Mobile Money est sélectionné
+                    if (selectedPaymentMethod == 'mobile') ...[
+                      const SizedBox(height: 16),
+                      const Text(
+                        'Choisissez votre opérateur :',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 8),
+
+                      // MTN Money
+                      Container(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        decoration: BoxDecoration(
+                          border: Border.all(
+                            color: selectedMobileProvider == 'mtn' ? Colors.orange : Colors.grey[300]!,
+                            width: selectedMobileProvider == 'mtn' ? 2 : 1,
+                          ),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: RadioListTile<String>(
+                          title: Row(
+                            children: [
+                              Container(
+                                width: 24,
+                                height: 24,
+                                decoration: BoxDecoration(
+                                  color: Colors.yellow[700],
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: const Center(
+                                  child: Text('M', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              const Text('MTN Money'),
+                            ],
+                          ),
+                          value: 'mtn',
+                          groupValue: selectedMobileProvider,
+                          onChanged: (value) {
+                            setState(() {
+                              selectedMobileProvider = value;
+                            });
+                          },
+                        ),
+                      ),
+
+                      // Orange Money
+                      Container(
+                        decoration: BoxDecoration(
+                          border: Border.all(
+                            color: selectedMobileProvider == 'orange' ? Colors.orange : Colors.grey[300]!,
+                            width: selectedMobileProvider == 'orange' ? 2 : 1,
+                          ),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: RadioListTile<String>(
+                          title: Row(
+                            children: [
+                              Container(
+                                width: 24,
+                                height: 24,
+                                decoration: BoxDecoration(
+                                  color: Colors.orange,
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: const Center(
+                                  child: Text('O', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              const Text('Orange Money'),
+                            ],
+                          ),
+                          value: 'orange',
+                          groupValue: selectedMobileProvider,
+                          onChanged: (value) {
+                            setState(() {
+                              selectedMobileProvider = value;
+                            });
+                          },
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('Annuler'),
+                ),
+                ElevatedButton(
+                  onPressed: (selectedPaymentMethod != null &&
+                              (selectedPaymentMethod == 'especes' ||
+                               (selectedPaymentMethod == 'mobile' && selectedMobileProvider != null)))
+                    ? () => Navigator.of(context).pop({
+                        'paymentMethod': selectedPaymentMethod,
+                        'mobileProvider': selectedMobileProvider,
+                      })
+                    : null,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.green,
+                    foregroundColor: Colors.white,
+                  ),
+                  child: const Text('Confirmer le paiement'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (result != null) {
+      await _processPayment(request, result);
+    }
+  }
+
+  /// Calcule le montant total d'une réservation
+  int _calculateReservationTotal(ReservationRequest request) {
+    // Calculer la durée en heures
+    final debut = TimeOfDay(
+      hour: int.parse(request.heureDebut.split(':')[0]),
+      minute: int.parse(request.heureDebut.split(':')[1]),
+    );
+    final fin = TimeOfDay(
+      hour: int.parse(request.heureFin.split(':')[0]),
+      minute: int.parse(request.heureFin.split(':')[1]),
+    );
+
+    final duration = (fin.hour * 60 + fin.minute) - (debut.hour * 60 + debut.minute);
+    final hours = duration ~/ 60;
+
+    // Trouver le prix du stade - nous pouvons utiliser une valeur par défaut ou chercher dans Firestore
+    // Pour simplifier, je vais utiliser un prix par défaut de 5000 FCFA/heure
+    return hours * 5000;
+  }
+
+  /// Traite le paiement sélectionné
+  Future<void> _processPayment(ReservationRequest request, Map<String, String?> paymentData) async {
+    try {
+      print('💳 Traitement du paiement pour ${request.stadeNom}');
+      print('💳 Mode: ${paymentData['paymentMethod']}');
+      if (paymentData['mobileProvider'] != null) {
+        print('💳 Opérateur: ${paymentData['mobileProvider']}');
+      }
+
+      // Afficher un dialogue de confirmation selon le mode de paiement
+      if (paymentData['paymentMethod'] == 'especes') {
+        await _showCashPaymentInstructions(request);
+      } else if (paymentData['paymentMethod'] == 'mobile') {
+        await _showMobilePaymentInstructions(request, paymentData['mobileProvider']!);
+      }
+
+    } catch (e) {
+      print('❌ Erreur lors du traitement du paiement: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Erreur lors du traitement du paiement'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  /// Affiche les instructions pour le paiement en espèces
+  Future<void> _showCashPaymentInstructions(ReservationRequest request) async {
+    await showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.money, color: Colors.green[700]),
+            const SizedBox(width: 8),
+            const Text('Paiement en espèces'),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.green[50],
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.green[200]!),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Instructions de paiement :',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  Text('• Rendez-vous au stade ${request.stadeNom}'),
+                  Text('• Montant à payer : ${_calculateReservationTotal(request)} FCFA'),
+                  const Text('• Payez directement au gestionnaire'),
+                  const Text('• Conservez votre reçu de paiement'),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.blue[50],
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.info, color: Colors.blue[700], size: 16),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      'Votre réservation sera confirmée après le paiement.',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Annuler'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              _updateReservationPaymentStatus(request, 'especes', null);
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.green,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Confirmer'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Affiche les instructions pour le paiement mobile
+  Future<void> _showMobilePaymentInstructions(ReservationRequest request, String provider) async {
+    final providerInfo = provider == 'mtn'
+      ? {'name': 'MTN Money', 'code': '*126#', 'color': Colors.yellow[700]!}
+      : {'name': 'Orange Money', 'code': '#144#', 'color': Colors.orange};
+
+    await showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.phone_android, color: Colors.blue[700]),
+            const SizedBox(width: 8),
+            Text('Paiement ${providerInfo['name']}'),
+          ],
+        ),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.blue[50],
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.blue[200]!),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Instructions de paiement :',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    Text('• Composez ${providerInfo['code']}'),
+                    Text('• Montant : ${_calculateReservationTotal(request)} FCFA'),
+                    const Text('• Numéro du gestionnaire : [À fournir]'),
+                    const Text('• Confirmez le paiement'),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.orange[50],
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  children: [
+                    Icon(Icons.warning, color: Colors.orange[700], size: 16),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        'Conservez le SMS de confirmation pour votre preuve de paiement.',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Annuler'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              _updateReservationPaymentStatus(request, 'mobile', provider);
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: providerInfo['color'] as Color,
+              foregroundColor: provider == 'mtn' ? Colors.black : Colors.white,
+            ),
+            child: const Text('Paiement effectué'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Met à jour le statut de paiement de la réservation
+  Future<void> _updateReservationPaymentStatus(ReservationRequest request, String paymentMethod, String? provider) async {
+    try {
+      print('💾 Mise à jour du statut de paiement...');
+
+      // Mettre à jour dans Firestore
+      final firebaseUser = FirebaseAuth.instance.currentUser;
+      if (firebaseUser != null) {
+        final querySnapshot = await FirebaseFirestore.instance
+            .collection('reservations')
+            .where('userId', isEqualTo: firebaseUser.uid)
+            .where('stadeNom', isEqualTo: request.stadeNom)
+            .where('dateReservation', isEqualTo: Timestamp.fromDate(request.dateReservation))
+            .where('heureDebut', isEqualTo: request.heureDebut)
+            .limit(1)
+            .get();
+
+        if (querySnapshot.docs.isNotEmpty) {
+          await querySnapshot.docs.first.reference.update({
+            'statut': 'paye',
+            'paymentMethod': paymentMethod,
+            if (provider != null) 'paymentProvider': provider,
+            'paymentDate': FieldValue.serverTimestamp(),
+          });
+
+          print('✅ Statut de paiement mis à jour dans Firestore');
+        }
+      }
+
+      // Mettre à jour localement
+      final index = _userReservations.indexWhere((r) =>
+        r.stadeNom == request.stadeNom &&
+        r.dateReservation == request.dateReservation &&
+        r.heureDebut == request.heureDebut
+      );
+
+      if (index != -1) {
+        _userReservations[index] = ReservationRequest(
+          id: request.id,
+          stadeId: request.stadeId,
+          stadeNom: request.stadeNom,
+          clientNom: request.clientNom,
+          clientEmail: request.clientEmail,
+          dateReservation: request.dateReservation,
+          heureDebut: request.heureDebut,
+          heureFin: request.heureFin,
+          raison: request.raison,
+          statut: 'paye', // Nouveau statut
+          dateCreation: request.dateCreation,
+        );
+      }
+
+      if (mounted) {
+        setState(() {});
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Paiement confirmé pour ${request.stadeNom}'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+
+      // Rendre le stade indisponible pour ce créneau
+      await _createUnavailableSlot(request);
+
+      // Optionnel: Envoyer une notification au gestionnaire
+      await _sendPaymentNotificationToManager(request, paymentMethod, provider);
+
+    } catch (e) {
+      print('❌ Erreur lors de la mise à jour du paiement: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Erreur lors de la confirmation du paiement'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  /// Crée un créneau indisponible pour le stade après validation ou paiement
+  Future<void> _createUnavailableSlot(ReservationRequest request, {String? raison}) async {
+    try {
+      print('🚫 Création créneau indisponible pour ${request.stadeNom} le ${DateFormat('dd/MM/yyyy').format(request.dateReservation)} de ${request.heureDebut} à ${request.heureFin}');
+
+      // Créer un document dans la collection 'unavailable_slots'
+      await FirebaseFirestore.instance.collection('unavailable_slots').add({
+        'stadeId': request.stadeId,
+        'stadeNom': request.stadeNom,
+        'date': Timestamp.fromDate(request.dateReservation),
+        'heureDebut': request.heureDebut,
+        'heureFin': request.heureFin,
+        'clientNom': request.clientNom,
+        'clientEmail': request.clientEmail,
+        'reservationId': request.id,
+        'createdAt': FieldValue.serverTimestamp(),
+        'createdBy': 'system', // Automatique après validation/paiement
+        'raison': raison ?? 'Réservation payée - Créneau occupé',
+      });
+
+      print('✅ Créneau indisponible créé avec succès');
+
+    } catch (e) {
+      print('❌ Erreur lors de la création du créneau indisponible: $e');
+    }
+  }
+
+  /// Envoie une notification au gestionnaire concernant le paiement
+  Future<void> _sendPaymentNotificationToManager(ReservationRequest request, String paymentMethod, String? provider) async {
+    try {
+      print('📧 Envoi notification de paiement au gestionnaire...');
+
+      // Chercher l'email du gestionnaire (même logique que pour les autres notifications)
+      QuerySnapshot? stadiumQuery;
+      if (request.stadeId != null && request.stadeId!.isNotEmpty) {
+        stadiumQuery = await FirebaseFirestore.instance
+            .collection('stadiums')
+            .where(FieldPath.documentId, isEqualTo: request.stadeId)
+            .limit(1)
+            .get();
+      }
+
+      if (stadiumQuery == null || stadiumQuery.docs.isEmpty) {
+        stadiumQuery = await FirebaseFirestore.instance
+            .collection('stadiums')
+            .where('nom', isEqualTo: request.stadeNom)
+            .limit(1)
+            .get();
+      }
+
+      if (stadiumQuery != null && stadiumQuery.docs.isNotEmpty) {
+        final stadiumData = stadiumQuery.docs.first.data() as Map<String, dynamic>;
+        final managerEmail = stadiumData['managerEmail'] as String?;
+
+        if (managerEmail != null && managerEmail.isNotEmpty) {
+          // TODO: Implémenter l'envoi d'email de notification de paiement
+          print('📧 Email de notification de paiement envoyé à: $managerEmail');
+          print('💳 Mode de paiement: $paymentMethod${provider != null ? ' ($provider)' : ''}');
+        }
+      }
+    } catch (e) {
+      print('❌ Erreur envoi notification paiement: $e');
+    }
+  }
+
+  /// Affiche le dialogue de gestion des créneaux indisponibles
+  void _showManageTimeSlotsDialog(Map<String, dynamic> stade) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            const Icon(Icons.schedule, color: Colors.purple),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text('Créneaux - ${stade['nom']}'),
+            ),
+          ],
+        ),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 400,
+          child: Column(
+            children: [
+              // Bouton pour ajouter un nouveau créneau indisponible
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: () {
+                    Navigator.of(context).pop();
+                    _showAddUnavailableSlotDialog(stade);
+                  },
+                  icon: const Icon(Icons.add, size: 16),
+                  label: const Text('Ajouter créneau indisponible'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.red,
+                    foregroundColor: Colors.white,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Liste des créneaux indisponibles
+              Expanded(
+                child: FutureBuilder<QuerySnapshot>(
+                  future: FirebaseFirestore.instance
+                      .collection('unavailable_slots')
+                      .where('stadeId', isEqualTo: stade['id'])
+                      .orderBy('date')
+                      .get(),
+                  builder: (context, snapshot) {
+                    if (snapshot.connectionState == ConnectionState.waiting) {
+                      return const Center(child: CircularProgressIndicator());
+                    }
+
+                    if (snapshot.hasError) {
+                      return Center(child: Text('Erreur: ${snapshot.error}'));
+                    }
+
+                    final slots = snapshot.data?.docs ?? [];
+
+                    if (slots.isEmpty) {
+                      return const Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(Icons.event_available, size: 64, color: Colors.grey),
+                            SizedBox(height: 16),
+                            Text(
+                              'Aucun créneau indisponible',
+                              style: TextStyle(color: Colors.grey),
+                            ),
+                          ],
+                        ),
+                      );
+                    }
+
+                    return ListView.builder(
+                      itemCount: slots.length,
+                      itemBuilder: (context, index) {
+                        final slot = slots[index].data() as Map<String, dynamic>;
+                        final date = (slot['date'] as Timestamp).toDate();
+                        final isOld = date.isBefore(DateTime.now().subtract(const Duration(days: 1)));
+
+                        return Card(
+                          margin: const EdgeInsets.only(bottom: 8),
+                          child: ListTile(
+                            leading: Icon(
+                              slot['createdBy'] == 'system' ? Icons.payment : Icons.block,
+                              color: isOld ? Colors.grey : (slot['createdBy'] == 'system' ? Colors.blue : Colors.red),
+                            ),
+                            title: Text(
+                              '${DateFormat('dd/MM/yyyy').format(date)} - ${slot['heureDebut']} à ${slot['heureFin']}',
+                              style: TextStyle(
+                                color: isOld ? Colors.grey : null,
+                                decoration: isOld ? TextDecoration.lineThrough : null,
+                              ),
+                            ),
+                            subtitle: Text(
+                              slot['raison'] ?? 'Aucune raison',
+                              style: TextStyle(color: isOld ? Colors.grey : null),
+                            ),
+                            trailing: !isOld ? IconButton(
+                              icon: const Icon(Icons.delete, color: Colors.red),
+                              onPressed: () async {
+                                // Confirmer la suppression
+                                final confirm = await showDialog<bool>(
+                                  context: context,
+                                  builder: (context) => AlertDialog(
+                                    title: const Text('Confirmer la suppression'),
+                                    content: const Text('Voulez-vous vraiment supprimer ce créneau indisponible ?'),
+                                    actions: [
+                                      TextButton(
+                                        onPressed: () => Navigator.of(context).pop(false),
+                                        child: const Text('Annuler'),
+                                      ),
+                                      TextButton(
+                                        onPressed: () => Navigator.of(context).pop(true),
+                                        child: const Text('Supprimer'),
+                                      ),
+                                    ],
+                                  ),
+                                );
+
+                                if (confirm == true) {
+                                  await slots[index].reference.delete();
+                                  if (context.mounted) {
+                                    // Rafraîchir le dialogue
+                                    Navigator.of(context).pop();
+                                    _showManageTimeSlotsDialog(stade);
+                                  }
+                                }
+                              },
+                            ) : null,
+                          ),
+                        );
+                      },
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Fermer'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Affiche le dialogue pour ajouter un créneau indisponible
+  void _showAddUnavailableSlotDialog(Map<String, dynamic> stade) {
+    // Liste des créneaux à bloquer
+    List<Map<String, dynamic>> slotsToBlock = [
+      {
+        'date': DateTime.now(),
+        'startTime': const TimeOfDay(hour: 8, minute: 0),
+        'endTime': const TimeOfDay(hour: 10, minute: 0),
+      }
+    ];
+    final raisonController = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setState) => AlertDialog(
+          title: Row(
+            children: [
+              const Icon(Icons.block, color: Colors.red),
+              const SizedBox(width: 8),
+              const Text('Bloquer des créneaux'),
+            ],
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: 500,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Stade: ${stade['nom']}'),
+                const SizedBox(height: 16),
+
+                // Bouton pour ajouter un nouveau créneau
+                Row(
+                  children: [
+                    ElevatedButton.icon(
+                      onPressed: () {
+                        setState(() {
+                          slotsToBlock.add({
+                            'date': DateTime.now(),
+                            'startTime': const TimeOfDay(hour: 8, minute: 0),
+                            'endTime': const TimeOfDay(hour: 10, minute: 0),
+                          });
+                        });
+                      },
+                      icon: const Icon(Icons.add, size: 16),
+                      label: const Text('Ajouter créneau'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.green,
+                        foregroundColor: Colors.white,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
+
+                // Liste des créneaux à bloquer
+                Expanded(
+                  child: ListView.builder(
+                    itemCount: slotsToBlock.length,
+                    itemBuilder: (context, index) {
+                      final slot = slotsToBlock[index];
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 16),
+                        child: Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                children: [
+                                  Text('Créneau ${index + 1}',
+                                      style: const TextStyle(fontWeight: FontWeight.bold)),
+                                  const Spacer(),
+                                  if (slotsToBlock.length > 1)
+                                    IconButton(
+                                      onPressed: () {
+                                        setState(() {
+                                          slotsToBlock.removeAt(index);
+                                        });
+                                      },
+                                      icon: const Icon(Icons.delete, color: Colors.red),
+                                    ),
+                                ],
+                              ),
+                              const SizedBox(height: 12),
+
+                              // Date
+                              InkWell(
+                                onTap: () async {
+                                  final date = await showDatePicker(
+                                    context: context,
+                                    initialDate: slot['date'],
+                                    firstDate: DateTime.now(),
+                                    lastDate: DateTime.now().add(const Duration(days: 365)),
+                                  );
+                                  if (date != null) {
+                                    setState(() {
+                                      slot['date'] = date;
+                                    });
+                                  }
+                                },
+                                child: Container(
+                                  padding: const EdgeInsets.all(12),
+                                  decoration: BoxDecoration(
+                                    border: Border.all(color: Colors.grey),
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      const Icon(Icons.calendar_today, size: 18),
+                                      const SizedBox(width: 8),
+                                      Text(DateFormat('dd/MM/yyyy').format(slot['date'])),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(height: 12),
+
+                              // Heures
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: InkWell(
+                                      onTap: () async {
+                                        final time = await showTimePicker(
+                                          context: context,
+                                          initialTime: slot['startTime'],
+                                        );
+                                        if (time != null) {
+                                          setState(() {
+                                            slot['startTime'] = time;
+                                          });
+                                        }
+                                      },
+                                      child: Container(
+                                        padding: const EdgeInsets.all(12),
+                                        decoration: BoxDecoration(
+                                          border: Border.all(color: Colors.grey),
+                                          borderRadius: BorderRadius.circular(8),
+                                        ),
+                                        child: Row(
+                                          children: [
+                                            const Icon(Icons.access_time, size: 18),
+                                            const SizedBox(width: 8),
+                                            Text(slot['startTime'].format(context)),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  const Text('à'),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: InkWell(
+                                      onTap: () async {
+                                        final time = await showTimePicker(
+                                          context: context,
+                                          initialTime: slot['endTime'],
+                                        );
+                                        if (time != null) {
+                                          setState(() {
+                                            slot['endTime'] = time;
+                                          });
+                                        }
+                                      },
+                                      child: Container(
+                                        padding: const EdgeInsets.all(12),
+                                        decoration: BoxDecoration(
+                                          border: Border.all(color: Colors.grey),
+                                          borderRadius: BorderRadius.circular(8),
+                                        ),
+                                        child: Row(
+                                          children: [
+                                            const Icon(Icons.access_time, size: 18),
+                                            const SizedBox(width: 8),
+                                            Text(slot['endTime'].format(context)),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+
+                // Raison commune
+                const Text('Raison (pour tous les créneaux):', style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: raisonController,
+                  decoration: const InputDecoration(
+                    hintText: 'Ex: Maintenance, Événement privé...',
+                    border: OutlineInputBorder(),
+                  ),
+                  maxLines: 2,
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Annuler'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                try {
+                  // Valider tous les créneaux
+                  for (int i = 0; i < slotsToBlock.length; i++) {
+                    final slot = slotsToBlock[i];
+                    final startTime = slot['startTime'] as TimeOfDay;
+                    final endTime = slot['endTime'] as TimeOfDay;
+
+                    final startMinutes = startTime.hour * 60 + startTime.minute;
+                    final endMinutes = endTime.hour * 60 + endTime.minute;
+
+                    if (endMinutes <= startMinutes) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('Créneau ${i + 1}: L\'heure de fin doit être après l\'heure de début'),
+                          backgroundColor: Colors.red,
+                        ),
+                      );
+                      return;
+                    }
+                  }
+
+                  // Créer tous les créneaux indisponibles
+                  final firestore = FirebaseFirestore.instance;
+                  final batch = firestore.batch();
+
+                  for (final slot in slotsToBlock) {
+                    final startTime = slot['startTime'] as TimeOfDay;
+                    final endTime = slot['endTime'] as TimeOfDay;
+                    final date = slot['date'] as DateTime;
+
+                    final docRef = firestore.collection('unavailable_slots').doc();
+                    batch.set(docRef, {
+                      'stadeId': stade['id'],
+                      'stadeNom': stade['nom'],
+                      'date': Timestamp.fromDate(date),
+                      'heureDebut': '${startTime.hour.toString().padLeft(2, '0')}:${startTime.minute.toString().padLeft(2, '0')}',
+                      'heureFin': '${endTime.hour.toString().padLeft(2, '0')}:${endTime.minute.toString().padLeft(2, '0')}',
+                      'raison': raisonController.text.isNotEmpty ? raisonController.text : 'Bloqué par le gestionnaire',
+                      'createdAt': FieldValue.serverTimestamp(),
+                      'createdBy': 'manager',
+                    });
+                  }
+
+                  await batch.commit();
+
+                  if (context.mounted) {
+                    Navigator.of(context).pop();
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text('${slotsToBlock.length} créneau(x) indisponible(s) créé(s) avec succès'),
+                        backgroundColor: Colors.green,
+                      ),
+                    );
+                    // Rouvrir le dialogue de gestion
+                    _showManageTimeSlotsDialog(stade);
+                  }
+
+                } catch (e) {
+                  print('❌ Erreur lors de la création des créneaux: $e');
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Erreur lors de la création des créneaux'),
+                        backgroundColor: Colors.red,
+                      ),
+                    );
+                  }
+                }
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.red,
+                foregroundColor: Colors.white,
+              ),
+              child: Text('Bloquer ${slotsToBlock.length} créneau${slotsToBlock.length > 1 ? 'x' : ''}'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTimeSlotsPreview(Map<String, dynamic> stade) {
+    return FutureBuilder<List<Map<String, String>>>(
+      future: _getUnavailableSlots(stade['id'] ?? stade['nom'], DateTime.now()),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const SizedBox(
+            height: 20,
+            child: Center(child: CircularProgressIndicator(strokeWidth: 2)),
+          );
+        }
+
+        final unavailableSlots = snapshot.data ?? [];
+        final today = DateTime.now();
+        final timeSlots = ['06:00', '08:00', '10:00', '12:00', '14:00', '16:00', '18:00', '20:00'];
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.schedule, size: 16, color: Colors.blue),
+                const SizedBox(width: 4),
+                Text(
+                  'Créneaux aujourd\'hui (${DateFormat('dd/MM').format(today)})',
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.blue,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 6,
+              runSpacing: 4,
+              children: timeSlots.map((timeSlot) {
+                // Vérifier si le créneau est occupé et quel type
+                Map<String, dynamic>? conflictingSlot;
+                for (final slot in unavailableSlots) {
+                  final startTime = slot['debut'] ?? '';
+                  final endTime = slot['fin'] ?? '';
+                  final slotTime = int.tryParse(timeSlot.split(':')[0]) ?? 0;
+                  final startHour = int.tryParse(startTime.split(':')[0]) ?? 0;
+                  final endHour = int.tryParse(endTime.split(':')[0]) ?? 0;
+                  if (slotTime >= startHour && slotTime < endHour) {
+                    conflictingSlot = slot;
+                    break;
+                  }
+                }
+
+                final isReserved = conflictingSlot != null;
+                final isBlocked = conflictingSlot?['type'] == 'blocked';
+
+                Color backgroundColor, borderColor, textColor;
+                String tooltip = timeSlot;
+
+                if (isReserved) {
+                  if (isBlocked) {
+                    // Créneau bloqué par gestionnaire
+                    backgroundColor = Colors.orange.shade100;
+                    borderColor = Colors.orange.shade300;
+                    textColor = Colors.orange.shade700;
+                    tooltip = '$timeSlot - Bloqué: ${conflictingSlot!['client']}';
+                  } else {
+                    // Créneau réservé par client
+                    backgroundColor = Colors.red.shade100;
+                    borderColor = Colors.red.shade300;
+                    textColor = Colors.red.shade700;
+                    tooltip = '$timeSlot - Réservé: ${conflictingSlot!['client']}';
+                  }
+                } else {
+                  // Créneau disponible
+                  backgroundColor = Colors.green.shade100;
+                  borderColor = Colors.green.shade300;
+                  textColor = Colors.green.shade700;
+                  tooltip = '$timeSlot - Disponible';
+                }
+
+                return Tooltip(
+                  message: tooltip,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: backgroundColor,
+                      border: Border.all(color: borderColor, width: 1),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      timeSlot,
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w500,
+                        color: textColor,
+                      ),
+                    ),
+                  ),
+                );
+              }).toList(),
+            ),
+            if (unavailableSlots.isNotEmpty) ...[
+              const SizedBox(height: 6),
+              Builder(
+                builder: (context) {
+                  final reservedCount = unavailableSlots.where((s) => s['type'] == 'reservation').length;
+                  final blockedCount = unavailableSlots.where((s) => s['type'] == 'blocked').length;
+
+                  String statusText = '';
+                  if (reservedCount > 0 && blockedCount > 0) {
+                    statusText = '$reservedCount réservé(s), $blockedCount bloqué(s)';
+                  } else if (reservedCount > 0) {
+                    statusText = '$reservedCount créneau(x) réservé(s)';
+                  } else if (blockedCount > 0) {
+                    statusText = '$blockedCount créneau(x) bloqué(s)';
+                  }
+
+                  return Row(
+                    children: [
+                      // Légende
+                      Row(
+                        children: [
+                          Container(
+                            width: 12,
+                            height: 12,
+                            decoration: BoxDecoration(
+                              color: Colors.green.shade100,
+                              border: Border.all(color: Colors.green.shade300),
+                              borderRadius: BorderRadius.circular(3),
+                            ),
+                          ),
+                          const SizedBox(width: 3),
+                          const Text('Libre', style: TextStyle(fontSize: 9)),
+                          const SizedBox(width: 8),
+                          Container(
+                            width: 12,
+                            height: 12,
+                            decoration: BoxDecoration(
+                              color: Colors.red.shade100,
+                              border: Border.all(color: Colors.red.shade300),
+                              borderRadius: BorderRadius.circular(3),
+                            ),
+                          ),
+                          const SizedBox(width: 3),
+                          const Text('Réservé', style: TextStyle(fontSize: 9)),
+                          const SizedBox(width: 8),
+                          Container(
+                            width: 12,
+                            height: 12,
+                            decoration: BoxDecoration(
+                              color: Colors.orange.shade100,
+                              border: Border.all(color: Colors.orange.shade300),
+                              borderRadius: BorderRadius.circular(3),
+                            ),
+                          ),
+                          const SizedBox(width: 3),
+                          const Text('Bloqué', style: TextStyle(fontSize: 9)),
+                        ],
+                      ),
+                      const Spacer(),
+                      if (statusText.isNotEmpty)
+                        Text(
+                          statusText,
+                          style: TextStyle(
+                            fontSize: 10,
+                            color: Colors.grey[600],
+                            fontStyle: FontStyle.italic,
+                          ),
+                        ),
+                    ],
+                  );
+                },
+              ),
+            ] else ...[
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Container(
+                    width: 12,
+                    height: 12,
+                    decoration: BoxDecoration(
+                      color: Colors.green.shade100,
+                      border: Border.all(color: Colors.green.shade300),
+                      borderRadius: BorderRadius.circular(3),
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    'Tous les créneaux sont disponibles',
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: Colors.green[700],
+                      fontStyle: FontStyle.italic,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ],
+        );
+      },
+    );
+  }
+
   Widget _buildStadeCard(BuildContext context, Map<String, dynamic> stade) {
+    return Card(
+      elevation: 4,
+      margin: const EdgeInsets.only(bottom: 16),
+      child: InkWell(
+        onTap: () {
+          _showStadeDetails(context, stade);
+        },
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Image placeholder
+            Container(
+              height: 200,
+              width: double.infinity,
+              decoration: BoxDecoration(
+                color: Colors.grey[300],
+                borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
+              ),
+              child: const Icon(
+                Icons.sports_soccer,
+                size: 60,
+                color: Colors.grey,
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Expanded(
+                        child: Text(
+                          stade['nom'],
+                          style: const TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: stade['disponible'] ? Colors.green : Colors.red,
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Text(
+                          stade['disponible'] ? 'Disponible' : 'Occupé',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 10,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Icon(Icons.location_on, size: 14, color: Colors.grey[600]),
+                      const SizedBox(width: 4),
+                      Expanded(
+                        child: Text(
+                          stade['quartier'],
+                          style: TextStyle(color: Colors.grey[600], fontSize: 13),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Icon(Icons.people, size: 14, color: Colors.grey[600]),
+                      const SizedBox(width: 4),
+                      Text(
+                        stade['capacite'],
+                        style: TextStyle(color: Colors.grey[600], fontSize: 13),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    stade['description'],
+                    style: TextStyle(color: Colors.grey[800], fontSize: 12),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 12),
+
+                  // Affichage des créneaux horaires pour les visiteurs
+                  if (_currentUserType == 'visiteur')
+                    _buildTimeSlotsPreview(stade),
+
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Flexible(
+                        child: Text(
+                          '${stade['prix']} FCFA/h',
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF1E88E5),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      _currentUserType == 'visiteur'
+                        ? ElevatedButton(
+                            onPressed: () {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('Veuillez vous connecter pour réserver'),
+                                  backgroundColor: Colors.orange,
+                                ),
+                              );
+                              Future.delayed(const Duration(seconds: 1), () {
+                                context.go('/login');
+                              });
+                            },
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.orange,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            ),
+                            child: const Text(
+                              'Se connecter',
+                              style: TextStyle(fontSize: 12),
+                            ),
+                          )
+                        : ElevatedButton(
+                            onPressed: () {
+                              _showReservationDialog(context, stade);
+                            },
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF1E88E5),
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            ),
+                            child: const Text(
+                              'Réserver',
+                              style: TextStyle(fontSize: 12),
+                            ),
+                          ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMyStadeCard(BuildContext context, Map<String, dynamic> stade) {
     return Card(
       elevation: 4,
       margin: const EdgeInsets.only(bottom: 16),
@@ -2854,19 +4982,47 @@ class _HomePageState extends State<HomePage> {
                         ),
                       ),
                       const SizedBox(width: 8),
-                      ElevatedButton(
-                        onPressed: () {
-                          _showReservationDialog(context, stade);
-                        },
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF1E88E5),
-                          foregroundColor: Colors.white,
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                        ),
-                        child: const Text(
-                          'Réserver',
-                          style: TextStyle(fontSize: 12),
-                        ),
+                      Row(
+                        children: [
+                          ElevatedButton.icon(
+                            onPressed: () {
+                              _showEditStadiumDialog(stade);
+                            },
+                            icon: const Icon(Icons.edit, size: 14),
+                            label: const Text('Modifier'),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.orange,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          ElevatedButton.icon(
+                            onPressed: () {
+                              _showManageTimeSlotsDialog(stade);
+                            },
+                            icon: const Icon(Icons.schedule, size: 14),
+                            label: const Text('Créneaux'),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.purple,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          ElevatedButton.icon(
+                            onPressed: () {
+                              _showDeleteStadiumDialog(stade);
+                            },
+                            icon: const Icon(Icons.delete, size: 14),
+                            label: const Text('Supprimer'),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.red,
+                              foregroundColor: Colors.white,
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
@@ -2916,6 +5072,28 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _showReservationDialog(BuildContext context, Map<String, dynamic> stade) async {
     try {
+      // Vérification d'authentification AVANT d'ouvrir le dialogue
+      final firebaseUser = FirebaseAuth.instance.currentUser;
+      final prefs = await SharedPreferences.getInstance();
+      final currentUser = prefs.getString('current_user');
+      final userType = prefs.getString('current_user_type') ?? 'visiteur';
+
+      // Bloquer l'accès si visiteur ou non-authentifié
+      // Vérification stricte : Firebase Auth ET type utilisateur valide
+      if (firebaseUser == null ||
+          currentUser == null ||
+          currentUser.isEmpty ||
+          currentUser == 'Visiteur' ||
+          userType == 'visiteur' ||
+          userType.isEmpty ||
+          !userType.contains('client') && !userType.contains('gestionnaire')) {
+        print('🚫 ACCÈS BLOQUÉ - User: "$currentUser", Type: "$userType", Firebase: ${firebaseUser?.email}');
+        print('🚫 Raison: Firebase=${firebaseUser == null}, User=${currentUser == null}, Type=$userType');
+        _showVisitorBlockDialogForReservation(context);
+        return;
+      }
+
+      print('✅ Accès au formulaire de réservation autorisé - User: $currentUser ($userType)');
       showDialog(
         context: context,
         builder: (context) => ReservationDialog(stade: stade),
@@ -2928,6 +5106,439 @@ class _HomePageState extends State<HomePage> {
         ),
       );
     }
+  }
+
+  void _showVisitorBlockDialogForReservation(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.warning, color: Colors.orange, size: 28),
+            const SizedBox(width: 8),
+            const Expanded(
+              child: Text(
+                'Connexion requise',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'ERREUR : Vous ne pouvez pas faire de réservation en tant que visiteur !',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.red),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Vous devez d\'abord vous connecter ou créer un compte.',
+              style: TextStyle(fontSize: 15),
+            ),
+            const SizedBox(height: 12),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.red.shade50,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.red.shade200),
+              ),
+              child: const Text(
+                '⚠️ ACCÈS REFUSÉ : Connectez-vous d\'abord avec votre compte ou créez un nouveau compte pour pouvoir effectuer des réservations.',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.red),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Annuler'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.of(context).pop(); // Close dialog
+              // Navigate to login
+              context.go('/login');
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF1E88E5),
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Se connecter'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.of(context).pop(); // Close dialog
+              // Navigate to registration
+              context.go('/register');
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF4CAF50),
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Créer un compte'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showAddStadiumDialog() {
+    final formKey = GlobalKey<FormState>();
+    final nomController = TextEditingController();
+    final adresseController = TextEditingController();
+    final prixController = TextEditingController();
+    final descriptionController = TextEditingController();
+    String capacite = '11v11';
+    String type = 'Terrain standard';
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Ajouter un nouveau stade'),
+        content: SingleChildScrollView(
+          child: Form(
+            key: formKey,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextFormField(
+                  controller: nomController,
+                  decoration: const InputDecoration(
+                    labelText: 'Nom du stade',
+                    border: OutlineInputBorder(),
+                  ),
+                  validator: (value) {
+                    if (value?.isEmpty == true) return 'Nom requis';
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 16),
+                TextFormField(
+                  controller: adresseController,
+                  decoration: const InputDecoration(
+                    labelText: 'Adresse',
+                    border: OutlineInputBorder(),
+                  ),
+                  validator: (value) {
+                    if (value?.isEmpty == true) return 'Adresse requise';
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 16),
+                TextFormField(
+                  controller: prixController,
+                  decoration: const InputDecoration(
+                    labelText: 'Prix par heure (FCFA)',
+                    border: OutlineInputBorder(),
+                  ),
+                  keyboardType: TextInputType.number,
+                  validator: (value) {
+                    if (value?.isEmpty == true) return 'Prix requis';
+                    if (int.tryParse(value!) == null) return 'Prix invalide';
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 16),
+                DropdownButtonFormField<String>(
+                  value: capacite,
+                  decoration: const InputDecoration(
+                    labelText: 'Capacité',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: ['5v5', '7v7', '11v11'].map((String value) {
+                    return DropdownMenuItem<String>(
+                      value: value,
+                      child: Text(value),
+                    );
+                  }).toList(),
+                  onChanged: (newValue) {
+                    capacite = newValue!;
+                  },
+                ),
+                const SizedBox(height: 16),
+                DropdownButtonFormField<String>(
+                  value: type,
+                  decoration: const InputDecoration(
+                    labelText: 'Type de terrain',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: ['Terrain standard', 'Terrain gazonné', 'Terrain synthétique', 'Terrain bétonné'].map((String value) {
+                    return DropdownMenuItem<String>(
+                      value: value,
+                      child: Text(value),
+                    );
+                  }).toList(),
+                  onChanged: (newValue) {
+                    type = newValue!;
+                  },
+                ),
+                const SizedBox(height: 16),
+                TextFormField(
+                  controller: descriptionController,
+                  decoration: const InputDecoration(
+                    labelText: 'Description',
+                    border: OutlineInputBorder(),
+                  ),
+                  maxLines: 3,
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Annuler'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              if (formKey.currentState!.validate()) {
+                try {
+                  await FirebaseFirestore.instance.collection('stadiums').add({
+                    'nom': nomController.text.trim(),
+                    'adresse': adresseController.text.trim(),
+                    'quartier': adresseController.text.trim().split(',').first,
+                    'prix': int.parse(prixController.text),
+                    'capacite': capacite,
+                    'type': type,
+                    'description': descriptionController.text.trim(),
+                    'gestionnaire': _currentUserName,
+                    'managerEmail': _currentUser,
+                    'disponible': true,
+                    'images': [],
+                    'dateCreation': FieldValue.serverTimestamp(),
+                  });
+
+                  Navigator.pop(context);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Stade ajouté avec succès!'),
+                      backgroundColor: Colors.green,
+                    ),
+                  );
+                  await _loadStades();
+                  setState(() {});
+                } catch (e) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('Erreur: $e'),
+                      backgroundColor: Colors.red,
+                    ),
+                  );
+                }
+              }
+            },
+            child: const Text('Ajouter'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showEditStadiumDialog(Map<String, dynamic> stade) {
+    final formKey = GlobalKey<FormState>();
+    final nomController = TextEditingController(text: stade['nom']);
+    final adresseController = TextEditingController(text: stade['adresse']);
+    final prixController = TextEditingController(text: stade['prix'].toString());
+    final descriptionController = TextEditingController(text: stade['description']);
+
+    // Ensure capacite value exists in dropdown options
+    const capaciteOptions = ['5v5', '7v7', '11v11'];
+    String capacite = capaciteOptions.contains(stade['capacite']) ? stade['capacite'] : '11v11';
+
+    // Ensure type value exists in dropdown options
+    const typeOptions = ['Terrain standard', 'Terrain gazonné', 'Terrain synthétique', 'Terrain bétonné'];
+    String type = typeOptions.contains(stade['type']) ? stade['type'] : 'Terrain standard';
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Modifier le stade'),
+        content: SingleChildScrollView(
+          child: Form(
+            key: formKey,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextFormField(
+                  controller: nomController,
+                  decoration: const InputDecoration(
+                    labelText: 'Nom du stade',
+                    border: OutlineInputBorder(),
+                  ),
+                  validator: (value) {
+                    if (value?.isEmpty == true) return 'Nom requis';
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 16),
+                TextFormField(
+                  controller: adresseController,
+                  decoration: const InputDecoration(
+                    labelText: 'Adresse',
+                    border: OutlineInputBorder(),
+                  ),
+                  validator: (value) {
+                    if (value?.isEmpty == true) return 'Adresse requise';
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 16),
+                TextFormField(
+                  controller: prixController,
+                  decoration: const InputDecoration(
+                    labelText: 'Prix par heure (FCFA)',
+                    border: OutlineInputBorder(),
+                  ),
+                  keyboardType: TextInputType.number,
+                  validator: (value) {
+                    if (value?.isEmpty == true) return 'Prix requis';
+                    if (int.tryParse(value!) == null) return 'Prix invalide';
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 16),
+                DropdownButtonFormField<String>(
+                  value: capacite,
+                  decoration: const InputDecoration(
+                    labelText: 'Capacité',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: ['5v5', '7v7', '11v11'].map((String value) {
+                    return DropdownMenuItem<String>(
+                      value: value,
+                      child: Text(value),
+                    );
+                  }).toList(),
+                  onChanged: (newValue) {
+                    capacite = newValue!;
+                  },
+                ),
+                const SizedBox(height: 16),
+                DropdownButtonFormField<String>(
+                  value: type,
+                  decoration: const InputDecoration(
+                    labelText: 'Type de terrain',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: ['Terrain standard', 'Terrain gazonné', 'Terrain synthétique', 'Terrain bétonné'].map((String value) {
+                    return DropdownMenuItem<String>(
+                      value: value,
+                      child: Text(value),
+                    );
+                  }).toList(),
+                  onChanged: (newValue) {
+                    type = newValue!;
+                  },
+                ),
+                const SizedBox(height: 16),
+                TextFormField(
+                  controller: descriptionController,
+                  decoration: const InputDecoration(
+                    labelText: 'Description',
+                    border: OutlineInputBorder(),
+                  ),
+                  maxLines: 3,
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Annuler'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              if (formKey.currentState!.validate()) {
+                try {
+                  await FirebaseFirestore.instance
+                      .collection('stadiums')
+                      .doc(stade['id'])
+                      .update({
+                    'nom': nomController.text.trim(),
+                    'adresse': adresseController.text.trim(),
+                    'quartier': adresseController.text.trim().split(',').first,
+                    'prix': int.parse(prixController.text),
+                    'capacite': capacite,
+                    'type': type,
+                    'description': descriptionController.text.trim(),
+                  });
+
+                  Navigator.pop(context);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Stade modifié avec succès!'),
+                      backgroundColor: Colors.green,
+                    ),
+                  );
+                  await _loadStades();
+                  setState(() {});
+                } catch (e) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('Erreur: $e'),
+                      backgroundColor: Colors.red,
+                    ),
+                  );
+                }
+              }
+            },
+            child: const Text('Modifier'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showDeleteStadiumDialog(Map<String, dynamic> stade) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Supprimer le stade'),
+        content: Text('Êtes-vous sûr de vouloir supprimer "${stade['nom']}" ? Cette action est irréversible.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Annuler'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              try {
+                await FirebaseFirestore.instance
+                    .collection('stadiums')
+                    .doc(stade['id'])
+                    .delete();
+
+                Navigator.pop(context);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Stade supprimé avec succès!'),
+                    backgroundColor: Colors.green,
+                  ),
+                );
+                await _loadStades();
+                setState(() {});
+              } catch (e) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text('Erreur: $e'),
+                    backgroundColor: Colors.red,
+                  ),
+                );
+              }
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('Supprimer', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -3002,6 +5613,7 @@ class _ReservationDialogState extends State<ReservationDialog> {
   }
 
   Future<void> _submitReservation() async {
+    print('🚀 DÉBUT _submitReservation - Création d\'une nouvelle demande de réservation');
     if (_formKey.currentState!.validate()) {
       try {
         // Check user authentication - use Firebase Auth + SharedPreferences
@@ -3091,7 +5703,7 @@ class _ReservationDialogState extends State<ReservationDialog> {
         
         final request = ReservationRequest(
           id: DateTime.now().millisecondsSinceEpoch.toString(),
-          stadeId: widget.stade['nom'],
+          stadeId: widget.stade['id'] ?? widget.stade['nom'], // Use stadium ID if available, fallback to name
           stadeNom: widget.stade['nom'],
           clientNom: _nomController.text.trim(),
           clientEmail: _emailController.text.trim(),
@@ -3105,28 +5717,39 @@ class _ReservationDialogState extends State<ReservationDialog> {
 
         // Sauvegarder dans Firestore pour les utilisateurs Firebase
         if (firebaseUser != null) {
-          await FirebaseFirestore.instance.collection('reservations').add({
+          final reservationData = {
             'userId': firebaseUser.uid,
             'stadeId': request.stadeId,
             'stadeNom': request.stadeNom,
             'clientNom': request.clientNom,
             'clientEmail': request.clientEmail,
-            'dateReservation': DateFormat('dd/MM/yyyy').format(request.dateReservation),
+            'dateReservation': Timestamp.fromDate(request.dateReservation),
             'heureDebut': request.heureDebut,
             'heureFin': request.heureFin,
             'raison': request.raison,
-            'statut': 'En attente',
-            'createdAt': FieldValue.serverTimestamp(),
-          });
-          
+            'statut': 'en_attente',
+            'dateCreation': FieldValue.serverTimestamp(),
+          };
+
+          print('💾 Sauvegarde réservation pour userId: ${firebaseUser.uid}');
+          print('📄 Données: $reservationData');
+
+          await FirebaseFirestore.instance.collection('reservations').add(reservationData);
+
           print('💾 Réservation sauvegardée dans Firestore');
-          
-          // Notifier le HomeScreen pour recharger les données
+
+          // Envoyer email de notification au gestionnaire
+          print('📧 APPEL de _sendManagerNotificationEmailForDialog pour: ${request.stadeNom}');
+          await _sendManagerNotificationEmailForDialog(request);
+
+          // Notifier le HomeScreen pour recharger les données et basculer vers l'historique
           if (context.mounted) {
             final homeState = context.findAncestorStateOfType<_HomePageState>();
             if (homeState != null) {
               await homeState._loadUserReservations();
-              homeState.setState(() {});
+              homeState.setState(() {
+                homeState._selectedTab = 'historique'; // Basculer vers l'onglet Historique
+              });
             }
           }
         }
@@ -3476,6 +6099,80 @@ class _ReservationDialogState extends State<ReservationDialog> {
         ),
       ),
     );
+  }
+
+  /// Envoie un email de notification au gestionnaire pour une nouvelle demande de réservation
+  Future<void> _sendManagerNotificationEmailForDialog(ReservationRequest request) async {
+    try {
+      print('📧 Recherche de l\'email du gestionnaire pour le stade: ${request.stadeNom} (ID: ${request.stadeId})');
+
+      // D'abord essayer de chercher par stadeId (plus fiable)
+      QuerySnapshot? stadiumQuery;
+      if (request.stadeId != null && request.stadeId!.isNotEmpty) {
+        print('🔍 Recherche par stadeId: ${request.stadeId}');
+        stadiumQuery = await FirebaseFirestore.instance
+            .collection('stadiums')
+            .where(FieldPath.documentId, isEqualTo: request.stadeId)
+            .limit(1)
+            .get();
+      }
+
+      // Si pas trouvé par ID, chercher par nom
+      if (stadiumQuery == null || stadiumQuery.docs.isEmpty) {
+        print('🔍 Recherche par nom du stade: ${request.stadeNom}');
+        stadiumQuery = await FirebaseFirestore.instance
+            .collection('stadiums')
+            .where('nom', isEqualTo: request.stadeNom)
+            .limit(1)
+            .get();
+      }
+
+      if (stadiumQuery == null || stadiumQuery.docs.isEmpty) {
+        print('⚠️ Stade non trouvé dans Firestore: ${request.stadeNom} (ID: ${request.stadeId})');
+        // Debug: lister tous les stades pour voir la structure
+        final allStadiums = await FirebaseFirestore.instance.collection('stadiums').limit(5).get();
+        print('🔍 Stades disponibles:');
+        for (var doc in allStadiums.docs) {
+          print('  - ID: ${doc.id}, Data: ${doc.data()}');
+        }
+        return;
+      }
+
+      final stadiumData = stadiumQuery.docs.first.data() as Map<String, dynamic>;
+      final managerEmail = stadiumData['managerEmail'] as String?;
+
+      print('🏟️ Stade trouvé: ${stadiumData}');
+
+      if (managerEmail == null || managerEmail.isEmpty) {
+        print('⚠️ Email du gestionnaire non trouvé pour le stade: ${request.stadeNom}');
+        return;
+      }
+
+      print('📧 Envoi notification au gestionnaire: $managerEmail');
+
+      // Utiliser le NotificationService pour l'envoi réel d'emails
+      final bool emailSent = await NotificationService.instance.sendNewReservationNotificationToManager(
+        managerEmail: managerEmail,
+        clientName: request.clientNom,
+        clientEmail: request.clientEmail,
+        stadeNom: request.stadeNom,
+        dateReservation: DateFormat('dd/MM/yyyy').format(request.dateReservation),
+        heureDebut: request.heureDebut,
+        heureFin: request.heureFin,
+        raison: request.raison,
+      );
+
+      if (emailSent) {
+        print('✅ Email de notification envoyé avec succès au gestionnaire: $managerEmail');
+      } else {
+        print('⚠️ Échec envoi email au gestionnaire, mais création de la réservation continue');
+      }
+
+    } catch (e) {
+      print('❌ Erreur envoi email au gestionnaire: $e');
+      // Ne pas faire échouer l'opération si l'email ne peut pas être envoyé
+      // On log juste l'erreur pour debugging
+    }
   }
 
   @override
