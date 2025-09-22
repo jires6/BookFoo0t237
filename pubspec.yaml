@@ -29,6 +29,12 @@ dependencies:
   cloud_firestore: ^5.4.4
   firebase_messaging: ^15.1.6
 
+  # Supabase pour le stockage des images
+  supabase_flutter: ^2.5.6
+
+  # Image picker pour sélectionner des images
+  image_picker: ^1.0.7
+
   # Storage
   shared_preferences: ^2.5.3
   

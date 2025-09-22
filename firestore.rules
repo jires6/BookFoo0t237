@@ -1,0 +1,47 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Règles pour la collection des utilisateurs
+    match /users/{userId} {
+      // Seul l'utilisateur connecté peut lire/écrire ses propres données
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Règles pour la collection des stades
+    match /stadiums/{stadiumId} {
+      // Permettre la lecture des stades disponibles à tous (connectés et visiteurs)
+      // OU permettre au gestionnaire de lire ses propres stades (disponibles ou non)
+      allow read: if resource.data.disponible == true ||
+        (request.auth != null && request.auth.token.email == resource.data.gestionnaire);
+
+      // Seuls les utilisateurs connectés peuvent créer des stades
+      allow create: if request.auth != null;
+
+      // Seul le gestionnaire du stade peut le modifier ou le supprimer
+      allow update, delete: if request.auth != null &&
+        request.auth.token.email == resource.data.gestionnaire;
+    }
+
+    // Règles pour la collection des réservations
+    match /reservations/{reservationId} {
+      // Seuls les utilisateurs connectés peuvent créer des réservations
+      allow create: if request.auth != null;
+
+      // L'utilisateur peut lire ses propres réservations
+      // Le gestionnaire du stade peut lire les réservations de son stade
+      allow read: if request.auth != null &&
+        (request.auth.token.email == resource.data.clientEmail ||
+         request.auth.token.email == resource.data.stadiumManager);
+
+      // Seul le client ou le gestionnaire peut modifier/supprimer la réservation
+      allow update, delete: if request.auth != null &&
+        (request.auth.token.email == resource.data.clientEmail ||
+         request.auth.token.email == resource.data.stadiumManager);
+    }
+
+    // Règles par défaut - refuser tout le reste
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

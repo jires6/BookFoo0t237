@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:bookfoot237/main.dart';
+import 'package:bookfoot237/core/app.dart';
 
 void main() {
   testWidgets('BookFoot237 smoke test', (WidgetTester tester) async {

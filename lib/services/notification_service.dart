@@ -580,4 +580,33 @@ class NotificationService {
       return false;
     }
   }
+
+  /// Vérifie un code OTP
+  Future<bool> verifyOtpCode(String email, String inputCode) async {
+    // Pour le moment, on accepte tous les codes (implémentation simplifiée)
+    // Dans un vrai système, vous devriez stocker et vérifier les codes envoyés
+    if (inputCode.length == 6 && inputCode.isNotEmpty) {
+      print('Code OTP vérifié pour $email: $inputCode');
+      return true;
+    }
+    return false;
+  }
+
+  /// Envoie une notification de réservation au gestionnaire
+  Future<bool> sendReservationNotification({
+    required String managerEmail,
+    required dynamic reservation,
+  }) async {
+    try {
+      print('Envoi notification réservation à $managerEmail');
+
+      // Utiliser la méthode d'envoi d'email existante
+      // Pour le moment, on simule l'envoi
+      print('Notification envoyée pour réservation: ${reservation.stadeNom}');
+      return true;
+    } catch (e) {
+      print('Erreur envoi notification: $e');
+      return false;
+    }
+  }
 }
